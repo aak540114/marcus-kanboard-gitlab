@@ -11,14 +11,14 @@
 <p align="center">
   <a href="#get-started">Quickstart</a> •
   <a href="https://marcus-ai.dev">Docs</a> •
-  <a href="https://discord.com/channels/1409498120739487859/1409498121456848907">Discord</a> •
+  <a href="https://discord.gg/DZWTbXr4">Discord</a> •
   <a href="ROADMAP.md">Roadmap</a> •
   <a href="PROTOCOL.md">Protocol</a>
 </p>
 
 <p align="center">
   <a href="https://github.com/lwgray/marcus"><img src="https://img.shields.io/github/stars/lwgray/marcus?style=social" alt="GitHub Stars"></a>
-  <a href="https://discord.com/channels/1409498120739487859/1409498121456848907"><img
+  <a href="https://discord.gg/DZWTbXr4"><img
 src="https://img.shields.io/discord/1409498120739487859?color=7289da&label=Discord&logo=discord&logoColor=white" alt="Discord"></a>
   <img src="https://img.shields.io/badge/python-3.11+-blue?logo=python&logoColor=white" alt="Python 3.11+">
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
@@ -361,9 +361,9 @@ By default Posidonius writes projects to `~/experiments/`.
 
 ## Community
 
-- [**Discord**](https://discord.com/channels/1409498120739487859/1409498121456848907) — real-time help and discussions
-- [**GitHub Discussions**](https://github.com/lwgray/marcus/discussions) — ideas and questions
-- [**GitHub Issues**](https://github.com/lwgray/marcus/issues) — bugs and feature requests
+- [**Discord**](https://discord.gg/DZWTbXr4) — real-time help, questions, and feedback. Report errors in `#bugs`
+- [**GitHub Issues**](https://github.com/lwgray/marcus/issues) — detailed bug reports (use [bug report template](/.github/ISSUE_TEMPLATE/bug_report.md)) and feature requests
+- [**GitHub Discussions**](https://github.com/lwgray/marcus/discussions) — ideas and long-form questions
 
 **For researchers and educators:** Board-mediated coordination extends the blackboard pattern to autonomous LLM agents - a named, citable variant for multi-agent-over-MCP systems. Marcus is MIT-licensed — use it in courses,
 papers, and experiments.  The pattern is documented in the [Architecture Docs](docs/source/architecture/).
