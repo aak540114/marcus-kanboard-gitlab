@@ -10,17 +10,18 @@ Full lifecycle
 1. ``BoardWatcher`` detects a new (or existing) ticket.
 2. If no Marcus AC block exists, ``ACGenerator`` produces one and posts
    it as a comment.  The AC is also embedded in the ticket description.
-3. The board watcher polls until a human assigns the ticket to themselves.
-4. On assignment, a ``ticket/{provider}/{id}`` branch is created and the
-   AI agent is notified to start work (via a Marcus comment on the ticket).
+3. The board watcher polls until a human **both** assigns the ticket to
+   themselves **and** moves it to the ``ready`` kanban column.
+4. On the ready trigger, a ``ticket/{provider}/{id}`` branch is created,
+   the kanban column is set to ``in progress``, and the AI agent is
+   notified via a Marcus comment on the ticket.
 5. The AI agent works, posting periodic progress comments.
-6. When the AI agent signals completion, the ticket moves to
-   ``AWAITING_ACCEPTANCE`` and a "Ready for Review" comment is posted.
-7. If the human comments with feedback, the AI re-reads the AC and
-   continues on the same branch, posting a revision acknowledgement.
-8. When the human closes / transitions the ticket to Done, the branch is
-   merged to main, a "Merged" comment is posted, and the ticket moves to
-   ``ACCEPTED``.
+6. When the AI agent signals completion (or needs human input), the
+   ticket moves to ``waiting for human`` and a matching comment is posted.
+7. If the human responds, the AI re-reads the comments and continues on
+   the same branch; the kanban column returns to ``in progress``.
+8. When the human marks the ticket ``done``, the branch is merged to
+   main, a "Merged" comment is posted, and the lifecycle state is ``DONE``.
 9. If the human later reopens the ticket, the branch is rebased on main
    and work resumes from step 5.
 
@@ -29,6 +30,16 @@ Hot-reload preview
 At any point a human can comment ``@marcus start-dev-env`` on the ticket
 (or click a button in a future UI) to spin up a hot-reload dev
 environment on the ticket branch.  The URL is posted back as a comment.
+
+Status model
+------------
+The six kanban column names that Marcus understands are::
+
+    todo  →  ready  →  in progress  ⇄  waiting for human
+                            │
+                        blocked (dependency)
+                            │
+                           done  →  (branch merged, REOPENED if reopened)
 
 Classes
 -------
@@ -46,6 +57,7 @@ from src.core.comment_protocol import CommentFormatter, CommentParser
 from src.core.dev_environment import DevEnvironmentManager
 from src.core.events import Events
 from src.core.git_branch_manager import BranchManager
+from src.core.models import TaskStatus
 from src.core.ticket_lifecycle import (
     InvalidTransitionError,
     TicketLifecycleManager,
@@ -135,6 +147,7 @@ class HumanGatedWorkflow:
         self._events.subscribe("ticket.new", self._on_ticket_new)
         self._events.subscribe("ticket.assigned", self._on_ticket_assigned)
         self._events.subscribe("ticket.unassigned", self._on_ticket_unassigned)
+        self._events.subscribe("ticket.status_changed", self._on_status_changed)
         self._events.subscribe("ticket.closed", self._on_ticket_closed)
         self._events.subscribe("ticket.reopened", self._on_ticket_reopened)
         self._events.subscribe("ticket.comment_added", self._on_comment_added)
@@ -173,89 +186,86 @@ class HumanGatedWorkflow:
                 )
 
     async def _on_ticket_assigned(self, event: Any) -> None:
-        """Handle a ticket being assigned to a human.
+        """Record the assignee; start AI work if the ticket is already ready.
 
-        AI work only starts here — unassigned tickets are ignored.
+        AI work requires BOTH an assignee AND the kanban column to be
+        ``ready``.  This handler records the assignee.  If the board
+        already shows the ``ready`` status (because the human moved the
+        column first), we trigger work immediately.
         """
         data = event.data
         ticket_id = data["ticket_id"]
         assignee = data.get("assignee", "unknown")
+        task_status = data.get("task", {}).get("status", "")
 
         record = self._lifecycle.get_or_create(ticket_id, self._provider)
 
-        if record.state not in (TicketState.UNASSIGNED, TicketState.ASSIGNED):
-            logger.debug(
-                "Ticket %s already in state %s — ignoring re-assign event",
-                ticket_id,
-                record.state.value,
-            )
-            return
-
-        # Transition to ASSIGNED.
+        # Record the assignee without a state transition.
         try:
-            self._lifecycle.transition(
-                ticket_id,
-                self._provider,
-                TicketState.ASSIGNED,
-                reason=f"Human {assignee!r} assigned ticket to themselves",
-                assignee=assignee,
-            )
-        except InvalidTransitionError as exc:
-            logger.debug("Cannot transition to ASSIGNED: %s", exc)
-            return
+            self._lifecycle.set_assignee(ticket_id, self._provider, assignee)
+        except KeyError:
+            pass
 
-        # Create the ticket branch.
-        branch_name = record.branch_name or BranchManager.make_branch_name(
-            self._provider, ticket_id
-        )
-        created = await self._branch.create_branch(branch_name)
-        if not created:
-            logger.error(
-                "Failed to create branch %s for ticket %s", branch_name, ticket_id
-            )
-            await self._post_error(
-                ticket_id,
-                f"Failed to create git branch `{branch_name}`. "
-                "Please check repository permissions.",
-            )
-            return
-
-        # Transition to IN_PROGRESS and post "started" comment.
-        self._lifecycle.transition(
-            ticket_id,
-            self._provider,
-            TicketState.IN_PROGRESS,
-            reason="Branch created; AI agent beginning work",
-        )
-
-        ac_items = self._get_ac_items(record)
-        comment = CommentFormatter.started(
-            ticket_id=ticket_id,
-            branch_name=branch_name,
-            assignee=assignee,
-            ac_items=ac_items,
-        )
-        await self._post_comment(ticket_id, comment)
-        logger.info("AI work started for ticket %s (branch %s)", ticket_id, branch_name)
+        # If the kanban board already shows "ready", start AI work now.
+        if (
+            task_status == TaskStatus.READY.value
+            and record.state == TicketState.TODO
+        ):
+            await self._start_ai_work(ticket_id, assignee, record)
 
     async def _on_ticket_unassigned(self, event: Any) -> None:
         """Handle a ticket being unassigned (AI should pause/stop)."""
         data = event.data
         ticket_id = data["ticket_id"]
         record = self._lifecycle.get(ticket_id, self._provider)
-        if record and record.state == TicketState.IN_PROGRESS:
+        if record and record.state in (TicketState.READY, TicketState.IN_PROGRESS):
             try:
                 self._lifecycle.transition(
                     ticket_id,
                     self._provider,
-                    TicketState.UNASSIGNED,
+                    TicketState.TODO,
                     reason="Ticket unassigned by human",
                 )
             except InvalidTransitionError:
                 pass
 
+    async def _on_status_changed(self, event: Any) -> None:
+        """Handle a kanban status/column change.
+
+        Triggers
+        --------
+        * ``ready`` with assignee present → start AI work.
+        * ``in_progress`` while WAITING_FOR_HUMAN → AI resumes.
+        * ``done`` is handled by the ``ticket.closed`` event; no action here.
+        """
+        data = event.data
+        ticket_id = data["ticket_id"]
+        new_status = data.get("new_status", "")
+
+        record = self._lifecycle.get(ticket_id, self._provider)
+        if record is None:
+            record = self._lifecycle.get_or_create(ticket_id, self._provider)
+
+        if new_status == TaskStatus.READY.value:
+            # Start AI work if we have an assignee and haven't started yet.
+            if record.assignee and record.state == TicketState.TODO:
+                await self._start_ai_work(ticket_id, record.assignee, record)
+
+        elif new_status == TaskStatus.IN_PROGRESS.value:
+            # Human moved ticket back to in_progress (e.g. after waiting_for_human).
+            if record.state == TicketState.WAITING_FOR_HUMAN:
+                try:
+                    self._lifecycle.transition(
+                        ticket_id,
+                        self._provider,
+                        TicketState.IN_PROGRESS,
+                        reason="Human moved ticket back to in progress",
+                    )
+                except InvalidTransitionError:
+                    pass
+
     async def _on_ticket_closed(self, event: Any) -> None:
-        """Handle a ticket being closed — merge branch to main."""
+        """Handle a ticket marked done — merge branch to main."""
         data = event.data
         ticket_id = data["ticket_id"]
         record = self._lifecycle.get(ticket_id, self._provider)
@@ -264,8 +274,8 @@ class HumanGatedWorkflow:
 
         if record.state not in (
             TicketState.IN_PROGRESS,
-            TicketState.AWAITING_ACCEPTANCE,
-            TicketState.REVISION_REQUESTED,
+            TicketState.WAITING_FOR_HUMAN,
+            TicketState.BLOCKED,
         ):
             return
 
@@ -285,8 +295,8 @@ class HumanGatedWorkflow:
             self._lifecycle.transition(
                 ticket_id,
                 self._provider,
-                TicketState.ACCEPTED,
-                reason="Human accepted; branch merged to main",
+                TicketState.DONE,
+                reason="Human marked done; branch merged to main",
             )
             self._lifecycle.set_merged(ticket_id, self._provider)
 
@@ -299,7 +309,7 @@ class HumanGatedWorkflow:
                 main_branch=main_branch,
             )
             await self._post_comment(ticket_id, comment)
-            logger.info("Ticket %s accepted and merged to %s", ticket_id, main_branch)
+            logger.info("Ticket %s done and merged to %s", ticket_id, main_branch)
         else:
             await self._post_error(
                 ticket_id,
@@ -342,6 +352,12 @@ class HumanGatedWorkflow:
         except InvalidTransitionError as exc:
             logger.debug("State transition on reopen failed: %s", exc)
 
+        # Move kanban column back to in progress.
+        try:
+            await self._kanban.move_task_to_column(ticket_id, "in progress")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not reset kanban column after reopen: %s", exc)
+
         logger.info(
             "Ticket %s reopened; branch %s rebased on main", ticket_id, branch_name
         )
@@ -358,7 +374,7 @@ class HumanGatedWorkflow:
             return
 
         record = self._lifecycle.get(ticket_id, self._provider)
-        if record is None or record.state == TicketState.UNASSIGNED:
+        if record is None or record.state == TicketState.TODO:
             return
 
         # Check for @marcus commands.
@@ -366,35 +382,39 @@ class HumanGatedWorkflow:
             await self._handle_start_dev_env_command(ticket_id, record)
             return
 
-        # If AI is awaiting acceptance, treat any human comment as a
-        # revision request.
-        if record.state == TicketState.AWAITING_ACCEPTANCE:
+        # If AI is waiting for human, treat any comment as a continuation
+        # signal: acknowledge the input and transition back to IN_PROGRESS.
+        if record.state == TicketState.WAITING_FOR_HUMAN:
             try:
                 self._lifecycle.transition(
                     ticket_id,
                     self._provider,
-                    TicketState.REVISION_REQUESTED,
-                    reason=f"Human {author!r} requested revision",
+                    TicketState.IN_PROGRESS,
+                    reason=f"Human {author!r} provided input; AI continuing",
                 )
             except InvalidTransitionError:
                 pass
 
-            # Acknowledge the revision request.
+            # Move kanban column back to in progress.
+            try:
+                await self._kanban.move_task_to_column(ticket_id, "in progress")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not update kanban column on comment: %s", exc)
+
             comment = CommentFormatter.revision_requested(
                 ticket_id=ticket_id,
                 human_comment=body,
                 ai_understanding=(
-                    "I'll re-read the acceptance criteria and your latest "
-                    "comment, apply the requested changes, and post a new "
-                    "Ready for Review update when complete."
+                    "Thanks for the input.  I'll apply the requested changes "
+                    "and post an update when complete."
                 ),
             )
             await self._post_comment(ticket_id, comment)
 
-        elif record.state == TicketState.REVISION_REQUESTED:
-            # Human adding more detail while AI is already reworking.
+        elif record.state == TicketState.IN_PROGRESS:
+            # Human commenting while AI is already working — log it.
             logger.debug(
-                "Additional comment on %s during revision: %s", ticket_id, body[:100]
+                "Human comment on %s while AI in progress: %s", ticket_id, body[:100]
             )
 
     async def _on_ac_changed(self, event: Any) -> None:
@@ -412,12 +432,14 @@ class HumanGatedWorkflow:
             ticket_id, self._provider, new_ac, new_hash
         )
 
-        if record.state in (TicketState.IN_PROGRESS, TicketState.AWAITING_ACCEPTANCE):
+        if record.state in (TicketState.IN_PROGRESS, TicketState.WAITING_FOR_HUMAN):
             try:
                 self._lifecycle.transition(
                     ticket_id,
                     self._provider,
-                    TicketState.REVISION_REQUESTED,
+                    TicketState.IN_PROGRESS
+                    if record.state == TicketState.WAITING_FOR_HUMAN
+                    else TicketState.WAITING_FOR_HUMAN,
                     reason="Acceptance criteria edited by human",
                 )
             except InvalidTransitionError:
@@ -477,8 +499,10 @@ class HumanGatedWorkflow:
     async def signal_ready_for_review(self, ticket_id: str) -> bool:
         """Signal that the AI agent is done and awaiting human acceptance.
 
-        Posts a "Ready for Review" comment and transitions the ticket to
-        ``AWAITING_ACCEPTANCE``.
+        Transitions the ticket to ``WAITING_FOR_HUMAN``, moves the kanban
+        column to ``waiting for human``, and posts a "Ready for Review"
+        comment asking the human to review the work and mark the ticket
+        ``done`` when satisfied.
 
         Parameters
         ----------
@@ -498,12 +522,20 @@ class HumanGatedWorkflow:
             self._lifecycle.transition(
                 ticket_id,
                 self._provider,
-                TicketState.AWAITING_ACCEPTANCE,
+                TicketState.WAITING_FOR_HUMAN,
                 reason="AI agent signalled implementation complete",
             )
         except InvalidTransitionError as exc:
-            logger.error("Cannot move %s to AWAITING_ACCEPTANCE: %s", ticket_id, exc)
+            logger.error(
+                "Cannot move %s to WAITING_FOR_HUMAN: %s", ticket_id, exc
+            )
             return False
+
+        # Move the kanban card to "waiting for human".
+        try:
+            await self._kanban.move_task_to_column(ticket_id, "waiting for human")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not update kanban column: %s", exc)
 
         dev_info = self._dev_env.get_info(ticket_id, self._provider)
         dev_url = dev_info.url if dev_info else None
@@ -518,6 +550,108 @@ class HumanGatedWorkflow:
             commit_count=len(commits),
         )
         return await self._post_comment(ticket_id, comment)
+
+    async def set_waiting_for_human(
+        self,
+        ticket_id: str,
+        reason: str = "AI agent requires human input to continue.",
+    ) -> bool:
+        """Signal that the AI needs external human input.
+
+        Transitions to ``WAITING_FOR_HUMAN`` and moves the kanban card to
+        the ``waiting for human`` column.  Use this when the AI is blocked
+        by something outside its control (e.g. missing credentials, unclear
+        requirement) rather than having finished the work.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        reason : str
+            Human-readable explanation of what input is needed.
+
+        Returns
+        -------
+        bool
+            ``True`` on success.
+        """
+        record = self._lifecycle.get(ticket_id, self._provider)
+        if record is None:
+            return False
+
+        if record.state != TicketState.IN_PROGRESS:
+            return False
+
+        try:
+            self._lifecycle.transition(
+                ticket_id,
+                self._provider,
+                TicketState.WAITING_FOR_HUMAN,
+                reason=f"AI waiting for human: {reason}",
+            )
+        except InvalidTransitionError as exc:
+            logger.error("Cannot set %s to WAITING_FOR_HUMAN: %s", ticket_id, exc)
+            return False
+
+        try:
+            await self._kanban.move_task_to_column(ticket_id, "waiting for human")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not update kanban column: %s", exc)
+
+        comment = CommentFormatter.revision_requested(
+            ticket_id=ticket_id,
+            human_comment="",
+            ai_understanding=reason,
+        )
+        return await self._post_comment(ticket_id, comment)
+
+    async def set_blocked(
+        self,
+        ticket_id: str,
+        blocked_by: str,
+    ) -> bool:
+        """Mark the ticket as blocked by an unresolved dependency.
+
+        Transitions to ``BLOCKED`` and moves the kanban card to the
+        ``blocked`` column.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        blocked_by : str
+            Description of the blocking dependency (e.g. ticket ID or
+            resource name).
+
+        Returns
+        -------
+        bool
+            ``True`` on success.
+        """
+        record = self._lifecycle.get(ticket_id, self._provider)
+        if record is None:
+            return False
+
+        if record.state != TicketState.IN_PROGRESS:
+            return False
+
+        try:
+            self._lifecycle.transition(
+                ticket_id,
+                self._provider,
+                TicketState.BLOCKED,
+                reason=f"Blocked by: {blocked_by}",
+            )
+        except InvalidTransitionError as exc:
+            logger.error("Cannot set %s to BLOCKED: %s", ticket_id, exc)
+            return False
+
+        try:
+            await self._kanban.move_task_to_column(ticket_id, "blocked")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not update kanban column: %s", exc)
+
+        return True
 
     async def start_dev_environment(self, ticket_id: str) -> Optional[str]:
         """Spin up the hot-reload dev environment for a ticket branch.
@@ -563,6 +697,84 @@ class HumanGatedWorkflow:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    async def _start_ai_work(
+        self,
+        ticket_id: str,
+        assignee: str,
+        record: TicketRecord,
+    ) -> None:
+        """Create branch, set ticket in-progress, and notify AI to start.
+
+        Called when both conditions are met: the ticket has an assignee
+        AND the kanban column is ``ready``.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        assignee : str
+            The human who claimed the ticket.
+        record : TicketRecord
+            Current lifecycle record (state must be ``TODO``).
+        """
+        # Transition Marcus state: TODO → READY → IN_PROGRESS.
+        try:
+            self._lifecycle.transition(
+                ticket_id,
+                self._provider,
+                TicketState.READY,
+                reason=f"Human {assignee!r} assigned and set to ready",
+                assignee=assignee,
+            )
+        except InvalidTransitionError as exc:
+            logger.debug("Cannot transition to READY: %s", exc)
+            return
+
+        # Create the ticket branch.
+        branch_name = record.branch_name or BranchManager.make_branch_name(
+            self._provider, ticket_id
+        )
+        created = await self._branch.create_branch(branch_name)
+        if not created:
+            logger.error(
+                "Failed to create branch %s for ticket %s", branch_name, ticket_id
+            )
+            await self._post_error(
+                ticket_id,
+                f"Failed to create git branch `{branch_name}`. "
+                "Please check repository permissions.",
+            )
+            return
+
+        # Transition to IN_PROGRESS.
+        try:
+            self._lifecycle.transition(
+                ticket_id,
+                self._provider,
+                TicketState.IN_PROGRESS,
+                reason="Branch created; AI agent beginning work",
+            )
+        except InvalidTransitionError as exc:
+            logger.error("Cannot transition to IN_PROGRESS: %s", exc)
+            return
+
+        # Move kanban card to "in progress".
+        try:
+            await self._kanban.move_task_to_column(ticket_id, "in progress")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not update kanban column to in_progress: %s", exc)
+
+        # Post "started" comment.
+        ac_items = self._get_ac_items(record)
+        comment = CommentFormatter.started(
+            ticket_id=ticket_id,
+            branch_name=branch_name,
+            assignee=assignee,
+            ac_items=ac_items,
+        )
+        await self._post_comment(ticket_id, comment)
+        logger.info("AI work started for ticket %s (branch %s)", ticket_id, branch_name)
+
     async def _generate_and_post_ac(
         self,
         ticket_id: str,
@@ -584,8 +796,6 @@ class HumanGatedWorkflow:
         await self._post_comment(ticket_id, comment)
 
         # Embed the AC block in the ticket description.
-        from src.core.acceptance_criteria import ACParser
-
         new_desc = ACParser.embed(description, ac_markdown)
         try:
             await self._kanban.update_task(ticket_id, {"description": new_desc})
@@ -614,8 +824,6 @@ class HumanGatedWorkflow:
 
     def _get_ac_items(self, record: TicketRecord) -> List[str]:
         """Return the list of AC item texts from the stored AC markdown."""
-        from src.core.acceptance_criteria import ACParser
-
         if not record.acceptance_criteria:
             return []
         ac = ACParser.extract(

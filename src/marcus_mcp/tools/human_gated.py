@@ -16,7 +16,14 @@ Tool list
 ``post_ticket_progress``
     Post a progress update comment (percentage + message).
 ``signal_ready_for_review``
-    Declare the AI agent's work done; moves ticket to AWAITING_ACCEPTANCE.
+    Declare the AI agent's work done; moves ticket to WAITING_FOR_HUMAN
+    and sets kanban column to "waiting for human".
+``signal_waiting_for_human``
+    Signal that the AI needs external human input; moves ticket to
+    WAITING_FOR_HUMAN without declaring implementation complete.
+``signal_blocked``
+    Signal that the ticket is blocked by an unresolved dependency; moves
+    kanban column to "blocked".
 ``get_ticket_lifecycle_state``
     Return the current lifecycle state and metadata for a ticket.
 ``start_ticket_dev_environment``
@@ -176,9 +183,10 @@ async def signal_ready_for_review(
 ) -> Dict[str, Any]:
     """Signal that the AI agent is done and the ticket is ready for human review.
 
-    This transitions the ticket to AWAITING_ACCEPTANCE and posts a
-    "Ready for Review" comment with the branch name, AC checklist, and
-    (optionally) a hot-reload dev environment URL.
+    This transitions the ticket to WAITING_FOR_HUMAN, moves the kanban
+    column to "waiting for human", and posts a "Ready for Review" comment
+    with the branch name, AC checklist, and (optionally) a hot-reload dev
+    environment URL.
 
     Parameters
     ----------
@@ -221,6 +229,104 @@ async def signal_ready_for_review(
         }
     except Exception as exc:  # noqa: BLE001
         logger.error("signal_ready_for_review failed: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+async def signal_waiting_for_human(
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Signal that the AI agent needs external human input to continue.
+
+    Moves the ticket to WAITING_FOR_HUMAN and sets the kanban column to
+    ``waiting for human``.  Use this when the AI is stuck on something it
+    cannot resolve on its own (e.g. unclear requirement, missing credentials)
+    rather than having finished the implementation.
+
+    Parameters
+    ----------
+    arguments : Dict[str, Any]
+        Required:
+            ``ticket_id`` — Ticket identifier.
+            ``provider`` — Kanban provider name.
+        Optional:
+            ``reason`` — Human-readable description of what input is needed.
+
+    Returns
+    -------
+    Dict[str, Any]
+        ``{success, result: {comment_posted}}`` or ``{success: False, error}``.
+    """
+    ticket_id = arguments.get("ticket_id", "")
+    provider = arguments.get("provider", "")
+    reason = arguments.get("reason", "AI agent requires human input to continue.")
+
+    if not ticket_id or not provider:
+        return {"success": False, "error": "ticket_id and provider are required"}
+
+    wf = _workflow()
+    if wf is None:
+        return {"success": False, "error": "HumanGatedWorkflow not initialised"}
+
+    try:
+        posted = await wf.set_waiting_for_human(ticket_id, reason=reason)
+        return {
+            "success": True,
+            "result": {
+                "comment_posted": posted,
+                "ticket_id": ticket_id,
+                "new_state": "waiting_for_human",
+            },
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error("signal_waiting_for_human failed: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+async def signal_blocked(
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Signal that the ticket is blocked by an unresolved dependency.
+
+    Moves the ticket to BLOCKED and sets the kanban column to ``blocked``.
+    The AI agent should call this when it discovers that another ticket or
+    external resource must be completed first.
+
+    Parameters
+    ----------
+    arguments : Dict[str, Any]
+        Required:
+            ``ticket_id`` — Ticket identifier.
+            ``provider`` — Kanban provider name.
+            ``blocked_by`` — Description of the blocking dependency.
+
+    Returns
+    -------
+    Dict[str, Any]
+        ``{success, result: {new_state}}`` or ``{success: False, error}``.
+    """
+    ticket_id = arguments.get("ticket_id", "")
+    provider = arguments.get("provider", "")
+    blocked_by = arguments.get("blocked_by", "unspecified dependency")
+
+    if not ticket_id or not provider:
+        return {"success": False, "error": "ticket_id and provider are required"}
+
+    wf = _workflow()
+    if wf is None:
+        return {"success": False, "error": "HumanGatedWorkflow not initialised"}
+
+    try:
+        ok = await wf.set_blocked(ticket_id, blocked_by=blocked_by)
+        return {
+            "success": ok,
+            "result": {
+                "ticket_id": ticket_id,
+                "new_state": "blocked",
+                "blocked_by": blocked_by,
+            },
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error("signal_blocked failed: %s", exc)
         return {"success": False, "error": str(exc)}
 
 

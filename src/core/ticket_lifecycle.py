@@ -3,26 +3,36 @@ Ticket lifecycle state machine for human-gated AI workflows.
 
 Every ticket processed by Marcus moves through a defined set of states.
 Humans gate transitions: an AI agent only starts work once a human
-assigns the ticket to themselves, and a branch only merges to main once
-the human explicitly accepts (closes) the ticket.
+assigns the ticket to themselves AND moves it to the ``ready`` column.
+A branch only merges to main once the human explicitly marks the ticket
+``done``.
 
 State diagram
 -------------
 ::
 
-    UNASSIGNED
-        │  human assigns to themselves
+    TODO
+        │  human assigns + sets status to "ready"
         ▼
-    ASSIGNED
-        │  board watcher notifies Marcus
+    READY
+        │  AI detects ready + assigned → creates branch
         ▼
-    IN_PROGRESS  ◄──────────────────────┐
-        │  AI finishes implementation   │ human requests revision
-        ▼                               │
-    AWAITING_ACCEPTANCE ───────────────►┘
-        │  human accepts / closes ticket
+    IN_PROGRESS ◄──────────────────────────────────────┐
+        │  AI needs human input                         │ human responds /
+        ▼                                               │ moves back to
+    WAITING_FOR_HUMAN ──────────────────────────────────┘  "in progress"
+        │  human satisfied → marks "done"
+        │
+    IN_PROGRESS
+        │  ticket depends on unfinished work
         ▼
-    ACCEPTED   ◄─────────── (branch merged to main)
+    BLOCKED
+        │  dependency resolved
+        ▼
+    IN_PROGRESS
+        │  human marks "done"
+        ▼
+    DONE  ◄────── (branch merged to main)
         │  human reopens ticket
         ▼
     REOPENED
@@ -58,47 +68,51 @@ class TicketState(Enum):
 
     Attributes
     ----------
-    UNASSIGNED : str
-        Ticket exists but no human has claimed it.  AI is idle.
-    ASSIGNED : str
-        A human assigned the ticket to themselves; AI will start.
+    TODO : str
+        Ticket exists but has not been assigned or readied.  AI is idle.
+    READY : str
+        Human assigned the ticket to themselves AND moved it to the ready
+        column.  AI will start creating the branch and working.
     IN_PROGRESS : str
-        AI agent is actively working on the ticket.
-    AWAITING_ACCEPTANCE : str
-        AI finished; waiting for human to review and accept.
-    REVISION_REQUESTED : str
-        Human asked for changes; AI is reworking the ticket.
-    ACCEPTED : str
-        Human accepted the work; branch has been merged to main.
+        AI agent is actively working on the ticket.  The kanban column is
+        "in progress".
+    WAITING_FOR_HUMAN : str
+        AI finished or needs external input; waiting for human response.
+        The kanban column is "waiting for human".
+    BLOCKED : str
+        Ticket depends on another unfinished ticket.  AI is paused.
+        The kanban column is "blocked".
+    DONE : str
+        Human marked the ticket done; branch has been merged to main.
     REOPENED : str
-        Human reopened an already-accepted ticket; AI will rebase and continue.
+        Human reopened an already-done ticket; AI will rebase and continue.
     """
 
-    UNASSIGNED = "unassigned"
-    ASSIGNED = "assigned"
+    TODO = "todo"
+    READY = "ready"
     IN_PROGRESS = "in_progress"
-    AWAITING_ACCEPTANCE = "awaiting_acceptance"
-    REVISION_REQUESTED = "revision_requested"
-    ACCEPTED = "accepted"
+    WAITING_FOR_HUMAN = "waiting_for_human"
+    BLOCKED = "blocked"
+    DONE = "done"
     REOPENED = "reopened"
 
 
 # Legal state transitions: {from: [allowed_to, ...]}
 _TRANSITIONS: Dict[TicketState, List[TicketState]] = {
-    TicketState.UNASSIGNED: [TicketState.ASSIGNED],
-    TicketState.ASSIGNED: [TicketState.IN_PROGRESS, TicketState.UNASSIGNED],
+    TicketState.TODO: [TicketState.READY],
+    TicketState.READY: [TicketState.IN_PROGRESS, TicketState.TODO],
     TicketState.IN_PROGRESS: [
-        TicketState.AWAITING_ACCEPTANCE,
-        TicketState.REVISION_REQUESTED,
-        TicketState.UNASSIGNED,
+        TicketState.WAITING_FOR_HUMAN,
+        TicketState.BLOCKED,
+        TicketState.DONE,
+        TicketState.TODO,
     ],
-    TicketState.AWAITING_ACCEPTANCE: [
-        TicketState.ACCEPTED,
-        TicketState.REVISION_REQUESTED,
+    TicketState.WAITING_FOR_HUMAN: [
         TicketState.IN_PROGRESS,
+        TicketState.DONE,
     ],
-    TicketState.REVISION_REQUESTED: [TicketState.IN_PROGRESS],
-    TicketState.ACCEPTED: [TicketState.REOPENED],
+    TicketState.BLOCKED: [TicketState.IN_PROGRESS],
+    TicketState.DONE: [TicketState.REOPENED],
     TicketState.REOPENED: [TicketState.IN_PROGRESS],
 }
 
@@ -114,7 +128,8 @@ class TicketRecord:
     provider : str
         Kanban provider name (``"github"``, ``"jira"``, etc.).
     state : TicketState
-        Current lifecycle state.
+        Current lifecycle state.  Starts as ``TODO``; advances to ``READY``
+        when a human assigns and readies the ticket.
     branch_name : str
         Git branch created for this ticket (``ticket/{provider}/{id}``).
     assignee : Optional[str]
@@ -141,7 +156,7 @@ class TicketRecord:
 
     ticket_id: str
     provider: str
-    state: TicketState = TicketState.UNASSIGNED
+    state: TicketState = TicketState.TODO
     branch_name: str = ""
     assignee: Optional[str] = None
     acceptance_criteria: str = ""
@@ -218,7 +233,7 @@ class TicketLifecycleManager:
         branch_name: str = "",
         acceptance_criteria: str = "",
     ) -> TicketRecord:
-        """Return the existing record or create a new UNASSIGNED one.
+        """Return the existing record or create a new TODO one.
 
         Parameters
         ----------
@@ -422,6 +437,42 @@ class TicketLifecycleManager:
         key = f"{provider}:{ticket_id}"
         record = self._records[key]
         record.dev_env_port = port
+        self._save()
+        return record
+
+    def set_assignee(
+        self,
+        ticket_id: str,
+        provider: str,
+        assignee: str,
+    ) -> TicketRecord:
+        """Record the human assignee without triggering a state transition.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+        assignee : str
+            Username of the human who claimed the ticket.
+
+        Returns
+        -------
+        TicketRecord
+            The updated record.
+
+        Raises
+        ------
+        KeyError
+            If the ticket is not tracked.
+        """
+        key = f"{provider}:{ticket_id}"
+        record = self._records.get(key)
+        if record is None:
+            raise KeyError(f"Ticket {key} is not tracked by lifecycle manager")
+        record.assignee = assignee
+        record.updated_at = datetime.now(timezone.utc)
         self._save()
         return record
 
