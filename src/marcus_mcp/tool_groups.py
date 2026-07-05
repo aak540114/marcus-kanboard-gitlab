@@ -38,6 +38,17 @@ TOOL_GROUPS: Dict[str, Set[str]] = {
         # Project history queries
         "query_project_history",
         "list_project_history_files",
+        # Human-gated workflow tools (Kanboard+GitLab integration)
+        "get_work_context",
+        "generate_acceptance_criteria",
+        "post_ticket_progress",
+        "signal_ready_for_review",
+        "signal_waiting_for_human",
+        "signal_blocked",
+        "get_ticket_lifecycle_state",
+        "get_pending_tickets",
+        "start_ticket_dev_environment",
+        "get_ticket_dev_environment_url",
     },
     "agent": {
         # Core workflow tools for autonomous agents
@@ -60,6 +71,17 @@ TOOL_GROUPS: Dict[str, Set[str]] = {
         # Project history queries
         "query_project_history",
         "list_project_history_files",
+        # Human-gated workflow tools (Kanboard+GitLab integration)
+        "get_work_context",
+        "generate_acceptance_criteria",
+        "post_ticket_progress",
+        "signal_ready_for_review",
+        "signal_waiting_for_human",
+        "signal_blocked",
+        "get_ticket_lifecycle_state",
+        "get_pending_tickets",
+        "start_ticket_dev_environment",
+        "get_ticket_dev_environment_url",
     },
     "analytics": {
         # All tools for comprehensive analytics (Cato)

@@ -976,6 +976,137 @@ def get_tool_definitions(role: str = "agent") -> List[types.Tool]:
         USAGE_REPORT_TOOL,
         # Cost tracking dashboard (#409)
         COST_SUMMARY_TOOL,
+        # Human-gated workflow tools (Kanboard+GitLab integration)
+        types.Tool(
+            name="get_work_context",
+            description=(
+                "Return everything a new AI agent needs to start working on a "
+                "ticket: title, description, acceptance criteria, git branch name, "
+                "local repo path, GitLab URL, and step-by-step instructions. "
+                "Call this first when assigned to a Kanboard ticket."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket_id": {
+                        "type": "string",
+                        "description": "Kanboard task ID",
+                    },
+                    "provider": {
+                        "type": "string",
+                        "description": "Kanban provider name (e.g. 'kanboard')",
+                    },
+                },
+                "required": ["ticket_id", "provider"],
+            },
+        ),
+        types.Tool(
+            name="generate_acceptance_criteria",
+            description="Generate and post an acceptance-criteria checklist for a ticket",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket_id": {"type": "string"},
+                    "provider": {"type": "string"},
+                    "title": {"type": "string", "description": "Ticket title"},
+                    "description": {"type": "string", "default": ""},
+                    "labels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                    },
+                },
+                "required": ["ticket_id", "provider", "title"],
+            },
+        ),
+        types.Tool(
+            name="post_ticket_progress",
+            description="Post a progress update comment on a Kanboard ticket",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket_id": {"type": "string"},
+                    "provider": {"type": "string"},
+                    "percentage": {
+                        "type": "integer",
+                        "description": "Completion 0-100",
+                    },
+                    "message": {"type": "string"},
+                },
+                "required": ["ticket_id", "provider", "percentage", "message"],
+            },
+        ),
+        types.Tool(
+            name="signal_ready_for_review",
+            description=(
+                "Declare AI work done; moves ticket to waiting-for-human "
+                "column in Kanboard"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket_id": {"type": "string"},
+                    "provider": {"type": "string"},
+                },
+                "required": ["ticket_id", "provider"],
+            },
+        ),
+        types.Tool(
+            name="signal_waiting_for_human",
+            description="Signal that AI needs human input before continuing",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket_id": {"type": "string"},
+                    "provider": {"type": "string"},
+                    "reason": {"type": "string", "default": ""},
+                },
+                "required": ["ticket_id", "provider"],
+            },
+        ),
+        types.Tool(
+            name="signal_blocked",
+            description="Signal that the ticket is blocked by an unresolved dependency",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket_id": {"type": "string"},
+                    "provider": {"type": "string"},
+                    "blocked_by": {"type": "string"},
+                },
+                "required": ["ticket_id", "provider", "blocked_by"],
+            },
+        ),
+        types.Tool(
+            name="get_ticket_lifecycle_state",
+            description="Return current lifecycle state and metadata for a ticket",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket_id": {"type": "string"},
+                    "provider": {"type": "string"},
+                },
+                "required": ["ticket_id", "provider"],
+            },
+        ),
+        types.Tool(
+            name="get_pending_tickets",
+            description="Return all tickets in a given lifecycle state",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "description": (
+                            "Lifecycle state, e.g. 'in_progress', "
+                            "'waiting_for_human', 'blocked'"
+                        ),
+                    },
+                    "provider": {"type": "string"},
+                },
+                "required": ["state"],
+            },
+        ),
     ]
 
     return human_tools
@@ -1592,6 +1723,35 @@ async def handle_tool_call(
                     "the web UI at http://localhost:8080"
                 ),
             }
+
+        # Human-gated workflow tools (Kanboard+GitLab integration)
+        elif name in {
+            "get_work_context",
+            "generate_acceptance_criteria",
+            "post_ticket_progress",
+            "signal_ready_for_review",
+            "signal_waiting_for_human",
+            "signal_blocked",
+            "get_ticket_lifecycle_state",
+            "get_pending_tickets",
+            "start_ticket_dev_environment",
+            "get_ticket_dev_environment_url",
+        }:
+            from .tools import human_gated as _hg
+
+            _dispatch = {
+                "get_work_context": _hg.get_work_context,
+                "generate_acceptance_criteria": _hg.generate_acceptance_criteria,
+                "post_ticket_progress": _hg.post_ticket_progress,
+                "signal_ready_for_review": _hg.signal_ready_for_review,
+                "signal_waiting_for_human": _hg.signal_waiting_for_human,
+                "signal_blocked": _hg.signal_blocked,
+                "get_ticket_lifecycle_state": _hg.get_ticket_lifecycle_state,
+                "get_pending_tickets": _hg.get_pending_tickets,
+                "start_ticket_dev_environment": _hg.start_ticket_dev_environment,
+                "get_ticket_dev_environment_url": _hg.get_ticket_dev_environment_url,
+            }
+            result = await _dispatch[name](arguments)
 
         else:
             result = {"error": f"Unknown tool: {name}"}
