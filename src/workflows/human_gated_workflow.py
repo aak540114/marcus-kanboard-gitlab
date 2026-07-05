@@ -49,7 +49,7 @@ HumanGatedWorkflow
 """
 
 import logging
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from src.core.acceptance_criteria import ACChangeDetector, ACGenerator, ACParser
 from src.core.board_watcher import BoardWatcher
@@ -98,6 +98,7 @@ class HumanGatedWorkflow:
         events: Events,
         provider_name: str,
         lifecycle: Optional[TicketLifecycleManager] = None,
+        project_sync: Optional[Any] = None,
         branch_manager: Optional[BranchManager] = None,
         dev_env_manager: Optional[DevEnvironmentManager] = None,
         ac_generator: Optional[ACGenerator] = None,
@@ -111,6 +112,7 @@ class HumanGatedWorkflow:
         self._branch = branch_manager or BranchManager()
         self._dev_env = dev_env_manager or DevEnvironmentManager()
         self._ac_gen = ac_generator or ACGenerator()
+        self._project_sync = project_sync  # Optional ProjectSyncWorkflow
         self._watcher = BoardWatcher(
             kanban=kanban,
             events=events,
@@ -692,6 +694,85 @@ class HumanGatedWorkflow:
         )
         await self._post_comment(ticket_id, comment)
         return info.url
+
+    async def get_work_context(
+        self,
+        ticket_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return everything an AI agent needs to start working on a ticket.
+
+        This is the single entry-point for any new AI agent connecting to
+        the Marcus–Kanboard–GitLab system.  A single call gives the agent:
+
+        - Ticket title and description (from Kanboard)
+        - Acceptance criteria checklist (from Marcus lifecycle store)
+        - Git branch name to check out
+        - Local repository path on disk
+        - GitLab remote URL
+        - Current lifecycle state
+        - MCP server URL for reporting back
+
+        Parameters
+        ----------
+        ticket_id : str
+            Kanboard task ID.
+
+        Returns
+        -------
+        Optional[Dict[str, Any]]
+            Context dict, or ``None`` if the ticket is not tracked.
+        """
+        record = self._lifecycle.get(ticket_id, self._provider)
+        if record is None:
+            return None
+
+        # Fetch live ticket details from Kanboard.
+        title = ticket_id
+        description = ""
+        kanboard_project_id: Optional[int] = None
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task:
+                title = task.name
+                description = task.description
+                src_ctx = task.source_context or {}
+                raw = src_ctx.get("kanboard_task", {})
+                project_id_raw = raw.get("project_id")
+                if project_id_raw:
+                    kanboard_project_id = int(project_id_raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch task %s from kanban: %s", ticket_id, exc)
+
+        # Repo info from ProjectSyncWorkflow (if wired up).
+        local_repo_path: Optional[str] = None
+        gitlab_repo_url: Optional[str] = None
+        if self._project_sync and kanboard_project_id is not None:
+            mapping = self._project_sync.get_repo_for_project(kanboard_project_id)
+            if mapping:
+                local_repo_path = mapping.get("local_repo_path")
+                gitlab_repo_url = mapping.get("gitlab_repo_url")
+
+        return {
+            "ticket_id": ticket_id,
+            "provider": self._provider,
+            "title": title,
+            "description": description,
+            "acceptance_criteria": record.acceptance_criteria or "",
+            "branch_name": record.branch_name,
+            "local_repo_path": local_repo_path,
+            "gitlab_repo_url": gitlab_repo_url,
+            "state": record.state.value,
+            "assignee": record.assignee,
+            "mcp_server_url": "http://localhost:4298/mcp",
+            "instructions": (
+                "1. cd into local_repo_path\n"
+                "2. git checkout branch_name\n"
+                "3. Read the description and acceptance_criteria\n"
+                "4. Implement the work; commit and push to the branch\n"
+                "5. Call signal_ready_for_review when done, "
+                "or signal_waiting_for_human / signal_blocked if stuck"
+            ),
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers

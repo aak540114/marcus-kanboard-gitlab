@@ -11,6 +11,10 @@ with ``success`` (bool) and either ``result`` (success) or ``error``
 
 Tool list
 ---------
+``get_work_context``
+    **Start here.** Returns everything a new AI agent needs to begin work
+    on a ticket: title, description, acceptance criteria, branch name,
+    local repo path, GitLab URL, and step-by-step instructions.
 ``generate_acceptance_criteria``
     Generate an AC checklist for a ticket and post it.
 ``post_ticket_progress``
@@ -545,3 +549,76 @@ async def get_pending_tickets(
             ],
         },
     }
+
+
+async def get_work_context(
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return everything a new AI agent needs to start working on a ticket.
+
+    This is the **first tool** any new AI agent should call after connecting
+    to the Marcus MCP server.  A single call returns the full work context:
+    ticket title, description, acceptance criteria, git branch name, local
+    repository path, GitLab remote URL, and step-by-step instructions.
+
+    Parameters
+    ----------
+    arguments : Dict[str, Any]
+        Required:
+            ``ticket_id`` — Ticket identifier (Kanboard task ID).
+            ``provider``  — Kanban provider name (e.g. ``"kanboard"``).
+
+    Returns
+    -------
+    Dict[str, Any]
+        ``{success, result: {ticket_id, provider, title, description,
+        acceptance_criteria, branch_name, local_repo_path, gitlab_repo_url,
+        state, assignee, mcp_server_url, instructions}}``
+        or ``{success: False, error}``.
+
+    Example
+    -------
+    An agent starting fresh calls::
+
+        get_work_context({"ticket_id": "42", "provider": "kanboard"})
+
+    and receives::
+
+        {
+          "ticket_id": "42",
+          "title": "Add checkout button",
+          "description": "Users need a checkout button ...",
+          "acceptance_criteria": "- [ ] Button visible on cart page\\n- [ ] ...",
+          "branch_name": "ticket/kanboard/42",
+          "local_repo_path": "./repos/my-app",
+          "gitlab_repo_url": "http://localhost:8929/root/my-app.git",
+          "state": "in_progress",
+          "mcp_server_url": "http://localhost:4298/mcp",
+          "instructions": "1. cd into local_repo_path ..."
+        }
+    """
+    ticket_id = arguments.get("ticket_id", "")
+    provider = arguments.get("provider", "")
+
+    if not ticket_id or not provider:
+        return {"success": False, "error": "ticket_id and provider are required"}
+
+    wf = _workflow()
+    if wf is None:
+        return {"success": False, "error": "HumanGatedWorkflow not initialised"}
+
+    try:
+        context = await wf.get_work_context(ticket_id)
+        if context is None:
+            return {
+                "success": False,
+                "error": (
+                    f"Ticket {ticket_id!r} is not tracked by Marcus. "
+                    "Ensure the ticket exists in Kanboard and has been seen "
+                    "by the BoardWatcher at least once."
+                ),
+            }
+        return {"success": True, "result": context}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("get_work_context failed: %s", exc)
+        return {"success": False, "error": str(exc)}
