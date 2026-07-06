@@ -109,7 +109,7 @@ picks it up and continues. **The board is the system of record.**
 - **Agents are stateless.** All state lives on the board.
 - **Tasks are the unit of coordination.** Each has context, dependencies, artifacts.
 - **MCP is the interface.** Any MCP-compatible agent works with Marcus.
-- **Observability is built in.** Every action is traceable through the board and Cato.
+- **Observability is built in.** Every action is traceable through the board.
 
 See [Architecture Docs](https://marcus-ai.dev) for deep dives.
 
@@ -135,8 +135,7 @@ frameworks can't offer:
 - **Full observability.** Every task, artifact, decision, and agent action is
   persisted to the board. Replay what happened, audit who did what, measure
   coordination overhead, and debug why an agent went off-rails — without
-  instrumenting anything. Cato gives you a live visualization; the board gives
-  you the ground truth.
+  instrumenting anything. The board gives you the ground truth.
 
 <p align="center">
   <img src="docs/assets/modes.png" width="720" alt="Universal agent support via MCP — Runner mode and Attach mode">
@@ -261,22 +260,7 @@ See the board in your terminal at any time:
 
 The live board (`--watch`) polls the SQLite database and re-renders in-place — you can watch tasks move from **Backlog → In Progress → Done** as agents work in real time.
 
-### Step 4: Choose a visual dashboard (optional)
-
-**Cato** — real-time visualization with a built-in kanban board. Watch every agent decision, every coordination event, every artifact lineage as it happens.
-
-📹 **[Watch the Cato demo →](assets/demo/cato_demo.mp4)** *(One prompt, eight agents, zero chat — fully observable.)*
-
-```bash
-# In a sibling directory
-git clone https://github.com/lwgray/cato.git
-cd cato && pip install -e . && ./cato start
-# Open http://localhost:5173
-```
-
-**Kanboard + GitLab** — fully self-hosted task management and git server with real-time push webhooks, per-ticket dev environments, and a "View Live Changes" button on every ticket. See [Local Kanboard + GitLab setup](#local-kanboard--gitlab-setup) below.
-
-### Step 5: Your first project — Runner mode
+### Step 4: Your first project — Runner mode
 
 ```bash
 mkdir ~/projects/my-todo-app
@@ -547,7 +531,7 @@ transparency, and letting the system — not any single agent — hold the truth
 | **2026-07-05** | Human-gated workflow, Kanboard provider, GitLab integration, ProjectWatcher, ProjectSyncWorkflow |
 | **2026-04-26** | v0.3.6 — parallel experiment isolation, agent auto-termination, DONE-task board integrity guards |
 | **2026-04-17** | v0.3.4 — `contract_first` default decomposer, `recommended_agents` in API response, `PROTOCOL.md` |
-| **2026-04-16** | Presented Marcus and Cato at Machine Learning Ambassador Conference, John Deere Financial (Des Moines, IA) |
+| **2026-04-16** | Presented Marcus at Machine Learning Ambassador Conference, John Deere Financial (Des Moines, IA) |
 | **2026-04-03** | v0.3.0 — SQLite default provider, Epictetus evaluation, `/marcus` skill |
 | **2026-03-21** | v0.2.1 — lease recovery, progressive timeouts, structured agent handoffs |
 | **2026-03-16** | v0.2.0 — AI-powered validation, centralized config, 115 commits since v0.1.3.1 |
