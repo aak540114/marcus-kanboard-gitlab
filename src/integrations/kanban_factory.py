@@ -10,11 +10,7 @@ from typing import Any, Dict, Optional
 from src.config.marcus_config import get_config
 from src.integrations.kanban_interface import KanbanInterface, KanbanProvider
 from src.integrations.providers import (
-    GitHubKanban,
-    JiraKanban,
     KanboardKanban,
-    LinearKanban,
-    Planka,
     SQLiteKanban,
 )
 
@@ -32,7 +28,7 @@ class KanbanFactory:
         Parameters
         ----------
         provider : str
-            Provider name ('planka', 'linear', 'github')
+            Provider name ('kanboard', 'sqlite')
         config : Optional[Dict[str, Any]]
             Optional configuration override
 
@@ -51,41 +47,7 @@ class KanbanFactory:
 
         provider_lower = provider.lower()
 
-        if provider_lower == KanbanProvider.PLANKA.value:
-            if not config:
-                config = {
-                    "project_name": os.getenv(
-                        "PLANKA_PROJECT_NAME", "Task Master Test"
-                    ),
-                }
-            # Use KanbanClient-based implementation
-            return Planka(config)
-
-        elif provider_lower == KanbanProvider.LINEAR.value:
-            if not config:
-                config = {
-                    "api_key": marcus_config.kanban.linear_api_key
-                    or os.getenv("LINEAR_API_KEY"),
-                    "team_id": marcus_config.kanban.linear_team_id
-                    or os.getenv("LINEAR_TEAM_ID"),
-                    "project_id": os.getenv("LINEAR_PROJECT_ID"),
-                }
-            return LinearKanban(config)
-
-        elif provider_lower == KanbanProvider.GITHUB.value:
-            if not config:
-                config = {
-                    "token": marcus_config.kanban.github_token
-                    or os.getenv("GITHUB_TOKEN"),
-                    "owner": marcus_config.kanban.github_owner
-                    or os.getenv("GITHUB_OWNER"),
-                    "repo": marcus_config.kanban.github_repo
-                    or os.getenv("GITHUB_REPO"),
-                    "project_number": int(os.getenv("GITHUB_PROJECT_NUMBER", "1")),
-                }
-            return GitHubKanban(config)  # type: ignore[abstract]
-
-        elif provider_lower == KanbanProvider.SQLITE.value:
+        if provider_lower == KanbanProvider.SQLITE.value:
             if not config:
                 config = {
                     "db_path": (
@@ -111,26 +73,6 @@ class KanbanFactory:
                     ),
                 }
             return SQLiteKanban(config)
-
-        elif provider_lower == KanbanProvider.JIRA.value:
-            if not config:
-                config = {
-                    "jira_url": (
-                        marcus_config.kanban.jira_url or os.getenv("JIRA_URL", "")
-                    ),
-                    "jira_email": (
-                        marcus_config.kanban.jira_email or os.getenv("JIRA_EMAIL", "")
-                    ),
-                    "jira_api_token": (
-                        marcus_config.kanban.jira_api_token
-                        or os.getenv("JIRA_API_TOKEN", "")
-                    ),
-                    "jira_project_key": (
-                        marcus_config.kanban.jira_project_key
-                        or os.getenv("JIRA_PROJECT_KEY")
-                    ),
-                }
-            return JiraKanban(config)
 
         elif provider_lower == KanbanProvider.KANBOARD.value:
             if not config:
