@@ -1,3 +1,5 @@
+REPO: marcus-kanboard-gitlab
+
 SESSION_START:
   - At session start, read ~/.simon/memory-bank/activeContext.md for current focus and recent state.
   - Also read ~/.simon/memory-bank/progress.md for what shipped / what's left / critical reminders.
@@ -5,18 +7,18 @@ SESSION_START:
   - When the user says "update simon memory bank", review the recent conversation and rewrite activeContext.md + progress.md to match the new state. Leave the other four files alone unless the stack or patterns actually changed.
 
 SIMON_DECISION_LOGGING:
-  Automatically capture decisions, blockers, and concerns to Simon as we work on marcus-kanboard-gitlab.
+  Automatically capture decisions, blockers, and concerns to Simon as we work on Marcus.
   Use the `simon` CLI via Bash tool. No need to ask permission for routine logging — just do it
   at the moment a decision/blocker/concern surfaces. Full automation guidelines:
   ~/.claude/skills/simon/SKILL.md
 
   WHAT TO LOG:
   - DECISION: significant architectural choices with rationale + alternatives
-    `simon log decision "what we chose" --rationale "why" --alternatives "A,B,C" --project marcus-kanboard-gitlab [--issue N]`
+    `simon log decision "what we chose" --rationale "why" --alternatives "A,B,C" --project marcus [--issue N]`
   - BLOCKER: external dependencies or critical uncertainties stopping progress
-    `simon log blocker "what is blocked" --by "what blocks it" --needs "what unblocks" --project marcus-kanboard-gitlab`
+    `simon log blocker "what is blocked" --by "what blocks it" --needs "what unblocks" --project marcus`
   - THOUGHT: risks, observations, concerns (not full blockers)
-    `simon log thought "concern text" --project marcus-kanboard-gitlab --urgency high|medium|low [--issue N]`
+    `simon log thought "concern text" --project marcus --urgency high|medium|low [--issue N]`
   - IMPETUS: major driving forces or deadlines that shape priorities
     `simon log impetus "name" --date YYYY-MM-DD --description "..." --drives "task1,task2"`
 
@@ -93,7 +95,7 @@ SIMON_DECISION_LOGGING:
   - Memory bank update: `simon digest --since 7d --update-memory-bank` (proposes diffs to activeContext.md + progress.md)
 
   PROJECT TAG:
-  - Default to `--project marcus-kanboard-gitlab` for all project work
+  - Default to `--project marcus` for all Marcus work
   - Use `--project simon` for Simon CLI itself, `--project mini` for marcus-mini work
   - GitHub issue numbers go in `--issue` (omit the # prefix)
 
@@ -102,7 +104,7 @@ SIMON_DECISION_LOGGING:
   Me: [run] simon log decision "rework agent assignment for topology awareness" \
               --rationale "loosely-coupled tasks fail without coupling graph" \
               --alternatives "stay with current,explicit deadlock prevention" \
-              --project marcus-kanboard-gitlab --issue 449
+              --project marcus --issue 449
   Me: [continue with the actual work]
   [Logging happens transparently — don't announce every log entry, just record and move on]
 
