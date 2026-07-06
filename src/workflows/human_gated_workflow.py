@@ -49,6 +49,7 @@ HumanGatedWorkflow
 """
 
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 
 from src.core.acceptance_criteria import ACChangeDetector, ACGenerator, ACParser
@@ -121,6 +122,9 @@ class HumanGatedWorkflow:
             on_error=self._on_watcher_error,
         )
         self._subscribed = False
+        # Unique identifier for this Marcus workflow instance — used as the
+        # agent_id when claiming tickets to prevent duplicate AI work.
+        self._agent_id = f"marcus-{uuid.uuid4().hex[:8]}"
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -188,56 +192,64 @@ class HumanGatedWorkflow:
                 )
 
     async def _on_ticket_assigned(self, event: Any) -> None:
-        """Record the assignee; start AI work if the ticket is already ready.
+        """Handle a ticket being assigned to a human.
 
-        AI work requires BOTH an assignee AND the kanban column to be
-        ``ready``.  This handler records the assignee.  If the board
-        already shows the ``ready`` status (because the human moved the
-        column first), we trigger work immediately.
+        When a human takes ownership, AI must stand down: the claim is
+        released so the human can work unimpeded.  A human can re-assign
+        later or unassign to let AI resume.
         """
         data = event.data
         ticket_id = data["ticket_id"]
         assignee = data.get("assignee", "unknown")
-        task_status = data.get("task", {}).get("status", "")
 
         record = self._lifecycle.get_or_create(ticket_id, self._provider)
 
-        # Record the assignee without a state transition.
+        # Record the human assignee.
         try:
             self._lifecycle.set_assignee(ticket_id, self._provider, assignee)
         except KeyError:
             pass
 
-        # If the kanban board already shows "ready", start AI work now.
-        if (
-            task_status == TaskStatus.READY.value
-            and record.state == TicketState.TODO
-        ):
-            await self._start_ai_work(ticket_id, assignee, record)
+        # Release any existing AI claim — human is taking over.
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
 
     async def _on_ticket_unassigned(self, event: Any) -> None:
-        """Handle a ticket being unassigned (AI should pause/stop)."""
+        """Handle a ticket becoming unassigned.
+
+        When the human removes their assignment the ticket is free for AI
+        to pick up.  If the ticket is in a workable state (``ready`` or
+        ``in_progress``) and no other AI agent has claimed it, AI starts.
+        """
         data = event.data
         ticket_id = data["ticket_id"]
         record = self._lifecycle.get(ticket_id, self._provider)
-        if record and record.state in (TicketState.READY, TicketState.IN_PROGRESS):
-            try:
-                self._lifecycle.transition(
-                    ticket_id,
-                    self._provider,
-                    TicketState.TODO,
-                    reason="Ticket unassigned by human",
-                )
-            except InvalidTransitionError:
-                pass
+        if record is None:
+            return
+
+        # Clear the stored assignee.
+        try:
+            self._lifecycle.set_assignee(ticket_id, self._provider, "")
+        except KeyError:
+            pass
+
+        # If the ticket is in a workable state, AI should start working.
+        if record.state in (TicketState.READY, TicketState.IN_PROGRESS):
+            await self._start_ai_work(ticket_id, record)
 
     async def _on_status_changed(self, event: Any) -> None:
         """Handle a kanban status/column change.
 
         Triggers
         --------
-        * ``ready`` with assignee present → start AI work.
-        * ``in_progress`` while WAITING_FOR_HUMAN → AI resumes.
+        * ``ready`` or ``in_progress``, ticket unassigned → AI starts.
+        * ``in_progress`` while WAITING_FOR_HUMAN → AI resumes (human
+          responded or moved card back).
+        * ``waiting_for_human`` moved by human → rejected with a warning
+          (that state is AI-only).
+        * ``todo`` / ``blocked`` → update lifecycle state accordingly.
         * ``done`` is handled by the ``ticket.closed`` event; no action here.
         """
         data = event.data
@@ -248,23 +260,68 @@ class HumanGatedWorkflow:
         if record is None:
             record = self._lifecycle.get_or_create(ticket_id, self._provider)
 
-        if new_status == TaskStatus.READY.value:
-            # Start AI work if we have an assignee and haven't started yet.
-            if record.assignee and record.state == TicketState.TODO:
-                await self._start_ai_work(ticket_id, record.assignee, record)
+        # Block human attempts to set the AI-only state.
+        if new_status == TaskStatus.WAITING_FOR_HUMAN.value:
+            logger.warning(
+                "Ticket %s: human moved card to waiting_for_human; "
+                "that state is reserved for AI — ignoring",
+                ticket_id,
+            )
+            return
 
-        elif new_status == TaskStatus.IN_PROGRESS.value:
-            # Human moved ticket back to in_progress (e.g. after waiting_for_human).
-            if record.state == TicketState.WAITING_FOR_HUMAN:
-                try:
-                    self._lifecycle.transition(
-                        ticket_id,
-                        self._provider,
-                        TicketState.IN_PROGRESS,
-                        reason="Human moved ticket back to in progress",
-                    )
-                except InvalidTransitionError:
-                    pass
+        if new_status in (TaskStatus.READY.value, TaskStatus.IN_PROGRESS.value):
+            if self._is_unassigned(record):
+                # Ticket is unassigned → AI should pick it up.
+                if new_status == TaskStatus.IN_PROGRESS.value and record.state == TicketState.WAITING_FOR_HUMAN:
+                    # Human moved the card from waiting_for_human to in_progress.
+                    try:
+                        self._lifecycle.human_transition(
+                            ticket_id,
+                            self._provider,
+                            TicketState.IN_PROGRESS,
+                            reason="Human moved ticket back to in progress",
+                        )
+                    except (InvalidTransitionError, KeyError):
+                        pass
+                else:
+                    await self._start_ai_work(ticket_id, record)
+            elif new_status == TaskStatus.IN_PROGRESS.value:
+                # Human-assigned ticket moved back to in_progress (e.g. from
+                # waiting_for_human by the human assignee).
+                if record.state == TicketState.WAITING_FOR_HUMAN:
+                    try:
+                        self._lifecycle.human_transition(
+                            ticket_id,
+                            self._provider,
+                            TicketState.IN_PROGRESS,
+                            reason="Human moved ticket back to in progress",
+                        )
+                    except (InvalidTransitionError, KeyError):
+                        pass
+
+        elif new_status == TaskStatus.TODO.value:
+            # Human reset the ticket to todo.
+            try:
+                self._lifecycle.human_transition(
+                    ticket_id,
+                    self._provider,
+                    TicketState.TODO,
+                    reason="Human moved ticket to todo",
+                )
+            except (InvalidTransitionError, KeyError):
+                pass
+
+        elif new_status == TaskStatus.BLOCKED.value:
+            # Human marked the ticket blocked.
+            try:
+                self._lifecycle.human_transition(
+                    ticket_id,
+                    self._provider,
+                    TicketState.BLOCKED,
+                    reason="Human marked ticket as blocked",
+                )
+            except (InvalidTransitionError, KeyError):
+                pass
 
     async def _on_ticket_closed(self, event: Any) -> None:
         """Handle a ticket marked done — merge branch to main."""
@@ -301,6 +358,7 @@ class HumanGatedWorkflow:
                 reason="Human marked done; branch merged to main",
             )
             self._lifecycle.set_merged(ticket_id, self._provider)
+            self._lifecycle.release_ticket(ticket_id, self._provider)
 
             # Stop dev env if running.
             await self._dev_env.stop(ticket_id, self._provider)
@@ -337,6 +395,12 @@ class HumanGatedWorkflow:
                 "failed — please resolve conflicts manually.",
             )
             return
+
+        # Clear any stale claim so AI can reclaim after reopen.
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
 
         try:
             self._lifecycle.transition(
@@ -763,6 +827,7 @@ class HumanGatedWorkflow:
             "gitlab_repo_url": gitlab_repo_url,
             "state": record.state.value,
             "assignee": record.assignee,
+            "already_claimed_by": record.ai_agent_id,
             "mcp_server_url": "http://localhost:4298/mcp",
             "instructions": (
                 "1. cd into local_repo_path\n"
@@ -781,35 +846,67 @@ class HumanGatedWorkflow:
     async def _start_ai_work(
         self,
         ticket_id: str,
-        assignee: str,
         record: TicketRecord,
     ) -> None:
-        """Create branch, set ticket in-progress, and notify AI to start.
+        """Claim the ticket, create branch, set in-progress, and notify AI.
 
-        Called when both conditions are met: the ticket has an assignee
-        AND the kanban column is ``ready``.
+        Called whenever both conditions are met: the ticket is unassigned
+        (``owner_id == 0`` on Kanboard) **and** the lifecycle state is
+        ``READY`` or ``IN_PROGRESS`` (or the kanban column just changed
+        to one of those states).
+
+        The claim gate ensures at most one Marcus instance starts work on
+        the same ticket concurrently.
 
         Parameters
         ----------
         ticket_id : str
             Ticket identifier.
-        assignee : str
-            The human who claimed the ticket.
         record : TicketRecord
-            Current lifecycle record (state must be ``TODO``).
+            Current lifecycle record.
         """
-        # Transition Marcus state: TODO → READY → IN_PROGRESS.
-        try:
-            self._lifecycle.transition(
+        # Atomically claim the ticket; abort if another agent already has it.
+        claimed = self._lifecycle.claim_ticket(
+            ticket_id, self._provider, self._agent_id
+        )
+        if not claimed:
+            current = self._lifecycle.get(ticket_id, self._provider)
+            logger.info(
+                "Ticket %s already claimed by %s; skipping",
                 ticket_id,
-                self._provider,
-                TicketState.READY,
-                reason=f"Human {assignee!r} assigned and set to ready",
-                assignee=assignee,
+                current.ai_agent_id if current else "unknown",
             )
-        except InvalidTransitionError as exc:
-            logger.debug("Cannot transition to READY: %s", exc)
             return
+
+        # Advance the lifecycle state to IN_PROGRESS via READY if needed.
+        if record.state == TicketState.TODO:
+            try:
+                self._lifecycle.transition(
+                    ticket_id,
+                    self._provider,
+                    TicketState.READY,
+                    reason="AI agent starting: ticket unassigned and workable",
+                )
+            except InvalidTransitionError as exc:
+                logger.debug("Cannot transition to READY: %s", exc)
+                self._lifecycle.release_ticket(ticket_id, self._provider)
+                return
+
+        if record.state in (TicketState.TODO, TicketState.READY):
+            try:
+                self._lifecycle.transition(
+                    ticket_id,
+                    self._provider,
+                    TicketState.IN_PROGRESS,
+                    reason="Branch created; AI agent beginning work",
+                )
+            except InvalidTransitionError as exc:
+                logger.error("Cannot transition to IN_PROGRESS: %s", exc)
+                self._lifecycle.release_ticket(ticket_id, self._provider)
+                return
+
+        # Re-fetch after transitions so branch_name is current.
+        record = self._lifecycle.get(ticket_id, self._provider) or record
 
         # Create the ticket branch.
         branch_name = record.branch_name or BranchManager.make_branch_name(
@@ -825,18 +922,7 @@ class HumanGatedWorkflow:
                 f"Failed to create git branch `{branch_name}`. "
                 "Please check repository permissions.",
             )
-            return
-
-        # Transition to IN_PROGRESS.
-        try:
-            self._lifecycle.transition(
-                ticket_id,
-                self._provider,
-                TicketState.IN_PROGRESS,
-                reason="Branch created; AI agent beginning work",
-            )
-        except InvalidTransitionError as exc:
-            logger.error("Cannot transition to IN_PROGRESS: %s", exc)
+            self._lifecycle.release_ticket(ticket_id, self._provider)
             return
 
         # Move kanban card to "in progress".
@@ -850,7 +936,7 @@ class HumanGatedWorkflow:
         comment = CommentFormatter.started(
             ticket_id=ticket_id,
             branch_name=branch_name,
-            assignee=assignee,
+            assignee=record.assignee or "AI agent",
             ac_items=ac_items,
         )
         await self._post_comment(ticket_id, comment)
@@ -920,6 +1006,24 @@ class HumanGatedWorkflow:
             )
             return items
         return [item.text for item in ac.items]
+
+    def _is_unassigned(self, record: TicketRecord) -> bool:
+        """Return ``True`` if no human is assigned to *record*.
+
+        Treats ``None``, empty string, and ``"0"`` (Kanboard's sentinel
+        for "no owner") as unassigned.
+
+        Parameters
+        ----------
+        record : TicketRecord
+            Lifecycle record to check.
+
+        Returns
+        -------
+        bool
+            ``True`` if the ticket has no human assignee.
+        """
+        return record.assignee in (None, "", "0")
 
     async def _post_comment(self, ticket_id: str, body: str) -> bool:
         """Post a comment via the kanban provider (best-effort)."""

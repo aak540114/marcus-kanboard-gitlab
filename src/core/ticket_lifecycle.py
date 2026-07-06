@@ -2,26 +2,36 @@
 Ticket lifecycle state machine for human-gated AI workflows.
 
 Every ticket processed by Marcus moves through a defined set of states.
-Humans gate transitions: an AI agent only starts work once a human
-assigns the ticket to themselves AND moves it to the ``ready`` column.
-A branch only merges to main once the human explicitly marks the ticket
-``done``.
+
+Assignment rules
+----------------
+- A ticket is **assigned to a human** when Kanboard's ``owner_id`` is
+  non-zero.  While a human holds the ticket, AI stays out.
+- A ticket is **unassigned** (``owner_id == 0``) when AI should work.
+- Humans can set **any state except** ``waiting_for_human`` (that state is
+  AI-only — it signals "I finished; please review").
+- AI should work on a ticket whenever its status is ``ready`` or
+  ``in_progress`` **and** the ticket is unassigned.
+
+Anti-duplication
+----------------
+:meth:`TicketLifecycleManager.claim_ticket` is an atomic test-and-set
+that lets exactly one AI agent claim a ticket.  If a second agent calls
+it while the first holds the claim, it returns ``False``.  The claim is
+released when the ticket moves to ``done``, ``todo``, or ``reopened``.
 
 State diagram
 -------------
 ::
 
-    TODO
-        │  human assigns + sets status to "ready"
+    TODO  ◄─────────────── (human reset from any state)
+        │  status → ready or in_progress, unassigned
         ▼
-    READY
-        │  AI detects ready + assigned → creates branch
-        ▼
-    IN_PROGRESS ◄──────────────────────────────────────┐
-        │  AI needs human input                         │ human responds /
-        ▼                                               │ moves back to
-    WAITING_FOR_HUMAN ──────────────────────────────────┘  "in progress"
-        │  human satisfied → marks "done"
+    READY / IN_PROGRESS ◄──────────────────────────────┐
+        │  AI claims ticket, creates branch             │ human responds /
+        ▼  status set to in_progress                    │ moves back to
+    WAITING_FOR_HUMAN ─────────────────────────────────┘  "in progress"
+        │  (AI-only state; humans cannot set this)
         │
     IN_PROGRESS
         │  ticket depends on unfinished work
@@ -32,7 +42,7 @@ State diagram
     IN_PROGRESS
         │  human marks "done"
         ▼
-    DONE  ◄────── (branch merged to main)
+    DONE  ◄────── (branch merged to main, claim released)
         │  human reopens ticket
         ▼
     REOPENED
@@ -97,8 +107,8 @@ class TicketState(Enum):
     REOPENED = "reopened"
 
 
-# Legal state transitions: {from: [allowed_to, ...]}
-_TRANSITIONS: Dict[TicketState, List[TicketState]] = {
+# Legal state transitions for AI-initiated moves: {from: [allowed_to, ...]}
+_AI_TRANSITIONS: Dict[TicketState, List[TicketState]] = {
     TicketState.TODO: [TicketState.READY],
     TicketState.READY: [TicketState.IN_PROGRESS, TicketState.TODO],
     TicketState.IN_PROGRESS: [
@@ -115,6 +125,9 @@ _TRANSITIONS: Dict[TicketState, List[TicketState]] = {
     TicketState.DONE: [TicketState.REOPENED],
     TicketState.REOPENED: [TicketState.IN_PROGRESS],
 }
+
+# States that only AI agents may set; humans cannot drag a card there.
+_HUMAN_FORBIDDEN_TARGETS: set[TicketState] = {TicketState.WAITING_FOR_HUMAN}
 
 
 @dataclass
@@ -315,7 +328,7 @@ class TicketLifecycleManager:
         if record is None:
             raise KeyError(f"Ticket {key} is not tracked by lifecycle manager")
 
-        allowed = _TRANSITIONS.get(record.state, [])
+        allowed = _AI_TRANSITIONS.get(record.state, [])
         if to_state not in allowed:
             raise InvalidTransitionError(
                 f"Cannot transition {key} from {record.state.value!r} "
@@ -474,6 +487,178 @@ class TicketLifecycleManager:
         record.assignee = assignee
         record.updated_at = datetime.now(timezone.utc)
         self._save()
+        return record
+
+    def human_transition(
+        self,
+        ticket_id: str,
+        provider: str,
+        to_state: TicketState,
+        *,
+        reason: str = "",
+        assignee: Optional[str] = None,
+    ) -> TicketRecord:
+        """Advance a ticket to a new state as initiated by a human actor.
+
+        Humans may move a ticket to any state **except**
+        ``WAITING_FOR_HUMAN`` (that state is set only by AI agents to
+        signal "I finished; please review").
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+        to_state : TicketState
+            Target state.
+        reason : str
+            Human-readable reason for the transition (stored in history).
+        assignee : Optional[str]
+            Set or update the assignee.
+
+        Returns
+        -------
+        TicketRecord
+            The updated record.
+
+        Raises
+        ------
+        KeyError
+            If the ticket is not tracked.
+        InvalidTransitionError
+            If *to_state* is ``WAITING_FOR_HUMAN``.
+        """
+        if to_state in _HUMAN_FORBIDDEN_TARGETS:
+            raise InvalidTransitionError(
+                f"Humans cannot set a ticket to {to_state.value!r}. "
+                "That state is reserved for AI agents."
+            )
+        key = f"{provider}:{ticket_id}"
+        record = self._records.get(key)
+        if record is None:
+            raise KeyError(f"Ticket {key} is not tracked by lifecycle manager")
+
+        from_state = record.state
+        record.state = to_state
+        record.updated_at = datetime.now(timezone.utc)
+
+        if assignee is not None:
+            record.assignee = assignee
+
+        record.history.append(
+            {
+                "from": from_state.value,
+                "to": to_state.value,
+                "timestamp": record.updated_at.isoformat(),
+                "reason": reason,
+                "actor": "human",
+            }
+        )
+
+        self._save()
+        logger.info(
+            "Ticket %s human-transitioned %s → %s  reason=%r",
+            key,
+            from_state.value,
+            to_state.value,
+            reason,
+        )
+        return record
+
+    def claim_ticket(
+        self,
+        ticket_id: str,
+        provider: str,
+        agent_id: str,
+    ) -> bool:
+        """Atomically claim a ticket for an AI agent.
+
+        This is the anti-duplication gate: at most one AI agent holds a
+        claim at any time.  A second call while another agent holds the
+        claim returns ``False`` without modifying the record.  The claim
+        is automatically released by :meth:`release_ticket`.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+        agent_id : str
+            Identifier of the claiming AI agent.
+
+        Returns
+        -------
+        bool
+            ``True`` if the claim was acquired; ``False`` if already
+            claimed by another agent.
+
+        Raises
+        ------
+        KeyError
+            If the ticket is not tracked.
+        """
+        key = f"{provider}:{ticket_id}"
+        record = self._records.get(key)
+        if record is None:
+            raise KeyError(f"Ticket {key} is not tracked by lifecycle manager")
+
+        if record.ai_agent_id is not None:
+            logger.debug(
+                "Ticket %s already claimed by %s; refused claim for %s",
+                key,
+                record.ai_agent_id,
+                agent_id,
+            )
+            return False
+
+        record.ai_agent_id = agent_id
+        record.updated_at = datetime.now(timezone.utc)
+        self._save()
+        logger.info("Ticket %s claimed by agent %s", key, agent_id)
+        return True
+
+    def release_ticket(
+        self,
+        ticket_id: str,
+        provider: str,
+    ) -> TicketRecord:
+        """Release the AI agent claim on a ticket.
+
+        Clears ``ai_agent_id`` so a new agent can claim it.  Safe to
+        call when the ticket is already unclaimed.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+
+        Returns
+        -------
+        TicketRecord
+            The updated record.
+
+        Raises
+        ------
+        KeyError
+            If the ticket is not tracked.
+        """
+        key = f"{provider}:{ticket_id}"
+        record = self._records.get(key)
+        if record is None:
+            raise KeyError(f"Ticket {key} is not tracked by lifecycle manager")
+
+        prev_agent = record.ai_agent_id
+        record.ai_agent_id = None
+        record.updated_at = datetime.now(timezone.utc)
+        self._save()
+        if prev_agent:
+            logger.info(
+                "Ticket %s claim released (was held by %s)", key, prev_agent
+            )
         return record
 
     def all_records(self) -> List[TicketRecord]:

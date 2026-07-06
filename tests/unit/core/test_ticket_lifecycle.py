@@ -257,3 +257,146 @@ class TestTicketLifecycleManager:
         manager.transition("T-14", "jira", TicketState.WAITING_FOR_HUMAN)
         rec = manager.transition("T-14", "jira", TicketState.DONE)
         assert rec.state == TicketState.DONE
+
+
+class TestHumanTransition:
+    """Tests for the human_transition() method.
+
+    Humans may move a ticket to any state except WAITING_FOR_HUMAN.
+    """
+
+    def test_human_can_transition_todo_to_in_progress_directly(self, manager):
+        """Human can jump from TODO to IN_PROGRESS without going via READY."""
+        manager.get_or_create("H-1", "jira")
+        rec = manager.human_transition("H-1", "jira", TicketState.IN_PROGRESS,
+                                       reason="human drag")
+        assert rec.state == TicketState.IN_PROGRESS
+
+    def test_human_can_transition_blocked_to_done(self, manager):
+        """Human can mark a BLOCKED ticket as DONE directly."""
+        manager.get_or_create("H-2", "jira")
+        manager.transition("H-2", "jira", TicketState.READY)
+        manager.transition("H-2", "jira", TicketState.IN_PROGRESS)
+        manager.transition("H-2", "jira", TicketState.BLOCKED)
+        rec = manager.human_transition("H-2", "jira", TicketState.DONE,
+                                       reason="human decided done")
+        assert rec.state == TicketState.DONE
+
+    def test_human_can_reset_any_state_to_todo(self, manager):
+        """Human can always move a ticket back to TODO."""
+        manager.get_or_create("H-3", "jira")
+        manager.transition("H-3", "jira", TicketState.READY)
+        manager.transition("H-3", "jira", TicketState.IN_PROGRESS)
+        manager.transition("H-3", "jira", TicketState.WAITING_FOR_HUMAN)
+        rec = manager.human_transition("H-3", "jira", TicketState.TODO,
+                                       reason="human reset")
+        assert rec.state == TicketState.TODO
+
+    def test_human_cannot_set_waiting_for_human(self, manager):
+        """human_transition raises InvalidTransitionError for WAITING_FOR_HUMAN."""
+        manager.get_or_create("H-4", "jira")
+        manager.transition("H-4", "jira", TicketState.READY)
+        manager.transition("H-4", "jira", TicketState.IN_PROGRESS)
+        with pytest.raises(InvalidTransitionError):
+            manager.human_transition("H-4", "jira", TicketState.WAITING_FOR_HUMAN)
+
+    def test_human_transition_records_actor_in_history(self, manager):
+        """History entries from human_transition carry actor='human'."""
+        manager.get_or_create("H-5", "jira")
+        manager.human_transition("H-5", "jira", TicketState.READY, reason="h")
+        rec = manager.get("H-5", "jira")
+        assert rec is not None
+        assert rec.history[0]["actor"] == "human"
+
+    def test_human_transition_untracked_ticket_raises(self, manager):
+        """human_transition raises KeyError for an untracked ticket."""
+        with pytest.raises(KeyError):
+            manager.human_transition("missing", "jira", TicketState.READY)
+
+    def test_human_transition_updates_assignee(self, manager):
+        """Passing assignee to human_transition stores it on the record."""
+        manager.get_or_create("H-6", "jira")
+        rec = manager.human_transition("H-6", "jira", TicketState.READY,
+                                       assignee="carol")
+        assert rec.assignee == "carol"
+
+
+class TestClaimRelease:
+    """Tests for claim_ticket() and release_ticket()."""
+
+    def test_first_claim_succeeds(self, manager):
+        """An unclaimed ticket can be claimed by an agent."""
+        manager.get_or_create("C-1", "jira")
+        result = manager.claim_ticket("C-1", "jira", "agent-alpha")
+        assert result is True
+        rec = manager.get("C-1", "jira")
+        assert rec is not None
+        assert rec.ai_agent_id == "agent-alpha"
+
+    def test_second_claim_fails_while_held(self, manager):
+        """A ticket already claimed cannot be claimed again."""
+        manager.get_or_create("C-2", "jira")
+        manager.claim_ticket("C-2", "jira", "agent-alpha")
+        result = manager.claim_ticket("C-2", "jira", "agent-beta")
+        assert result is False
+        rec = manager.get("C-2", "jira")
+        assert rec is not None
+        assert rec.ai_agent_id == "agent-alpha"  # original holder unchanged
+
+    def test_same_agent_cannot_double_claim(self, manager):
+        """A claim cannot be renewed while still held (returns False)."""
+        manager.get_or_create("C-3", "jira")
+        manager.claim_ticket("C-3", "jira", "agent-alpha")
+        result = manager.claim_ticket("C-3", "jira", "agent-alpha")
+        assert result is False
+
+    def test_release_clears_agent_id(self, manager):
+        """release_ticket clears ai_agent_id."""
+        manager.get_or_create("C-4", "jira")
+        manager.claim_ticket("C-4", "jira", "agent-alpha")
+        manager.release_ticket("C-4", "jira")
+        rec = manager.get("C-4", "jira")
+        assert rec is not None
+        assert rec.ai_agent_id is None
+
+    def test_claim_after_release_succeeds(self, manager):
+        """A ticket can be reclaimed after being released."""
+        manager.get_or_create("C-5", "jira")
+        manager.claim_ticket("C-5", "jira", "agent-alpha")
+        manager.release_ticket("C-5", "jira")
+        result = manager.claim_ticket("C-5", "jira", "agent-beta")
+        assert result is True
+        rec = manager.get("C-5", "jira")
+        assert rec is not None
+        assert rec.ai_agent_id == "agent-beta"
+
+    def test_release_on_unclaimed_is_safe(self, manager):
+        """release_ticket on an unclaimed ticket does not raise."""
+        manager.get_or_create("C-6", "jira")
+        manager.release_ticket("C-6", "jira")  # should not raise
+        rec = manager.get("C-6", "jira")
+        assert rec is not None
+        assert rec.ai_agent_id is None
+
+    def test_claim_untracked_raises(self, manager):
+        """claim_ticket on an untracked ticket raises KeyError."""
+        with pytest.raises(KeyError):
+            manager.claim_ticket("missing", "jira", "agent-x")
+
+    def test_release_untracked_raises(self, manager):
+        """release_ticket on an untracked ticket raises KeyError."""
+        with pytest.raises(KeyError):
+            manager.release_ticket("missing", "jira")
+
+    def test_claim_persists_across_restart(self, state_file):
+        """Claim survives a manager restart (persisted to disk)."""
+        m1 = TicketLifecycleManager(state_file=state_file)
+        m1.get_or_create("C-7", "jira")
+        m1.claim_ticket("C-7", "jira", "agent-gamma")
+
+        m2 = TicketLifecycleManager(state_file=state_file)
+        rec = m2.get("C-7", "jira")
+        assert rec is not None
+        assert rec.ai_agent_id == "agent-gamma"
+        # Second manager cannot steal the claim.
+        assert m2.claim_ticket("C-7", "jira", "agent-delta") is False
