@@ -35,12 +35,13 @@ logger = logging.getLogger(__name__)
 _COLUMN_STATUS_MAP: Dict[str, TaskStatus] = {
     # TODO-family
     "backlog": TaskStatus.TODO,
-    "ready": TaskStatus.TODO,
     "todo": TaskStatus.TODO,
     "to do": TaskStatus.TODO,
     "open": TaskStatus.TODO,
     "new": TaskStatus.TODO,
     "queue": TaskStatus.TODO,
+    # READY-family — human-gated workflow trigger column
+    "ready": TaskStatus.READY,
     # IN_PROGRESS-family
     "in progress": TaskStatus.IN_PROGRESS,
     "in development": TaskStatus.IN_PROGRESS,
@@ -52,6 +53,10 @@ _COLUMN_STATUS_MAP: Dict[str, TaskStatus] = {
     "review": TaskStatus.IN_PROGRESS,
     "in review": TaskStatus.IN_PROGRESS,
     "testing": TaskStatus.IN_PROGRESS,
+    # WAITING_FOR_HUMAN-family
+    "waiting for human": TaskStatus.WAITING_FOR_HUMAN,
+    "waiting": TaskStatus.WAITING_FOR_HUMAN,
+    "pending review": TaskStatus.WAITING_FOR_HUMAN,
     # BLOCKED-family
     "blocked": TaskStatus.BLOCKED,
     "block": TaskStatus.BLOCKED,
@@ -177,15 +182,15 @@ class KanboardKanban(KanbanInterface):
                 exc.response.status_code,
                 exc.response.text[:200],
             )
-            assert self._client is not None
-            await self._client.aclose()
-            self._client = None
+            if self._client is not None:
+                await self._client.aclose()
+                self._client = None
             return False
         except (httpx.HTTPError, RuntimeError) as exc:
             logger.error("Kanboard connection error: %s", exc)
-            assert self._client is not None
-            await self._client.aclose()
-            self._client = None
+            if self._client is not None:
+                await self._client.aclose()
+                self._client = None
             return False
 
     async def disconnect(self) -> None:
@@ -546,11 +551,10 @@ class KanboardKanban(KanbanInterface):
         if message:
             comment += f"\n\n{message}"
 
-        # Optionally move to In Progress when work starts
-        if progress > 0 and progress < 100:
+        # Move to In Progress when work starts (but never auto-close;
+        # closing is a human action gated by HumanGatedWorkflow).
+        if 0 < progress < 100:
             await self.move_task_to_column(task_id, "In Progress")
-        elif progress >= 100:
-            await self.move_task_to_column(task_id, "Done")
 
         return await self.add_comment(task_id, comment)
 
