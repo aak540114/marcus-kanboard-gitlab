@@ -3495,6 +3495,7 @@ function save() {{
                 if path.endswith("/project"):
                     pid = body.get("project_id")
                     gate = body.get("gate")
+                    verify = body.get("verify")  # optional bool
                     if not isinstance(pid, int) or gate not in ("human", "ai"):
                         r = JSONResponse(
                             {"error": "project_id (int) and gate ('human'|'ai') required"},
@@ -3503,20 +3504,31 @@ function save() {{
                         r.headers["Access-Control-Allow-Origin"] = "*"
                         return r
                     gate_mgr.set_project_gate(pid, gate)
-                    r = JSONResponse({"saved": True, "project_id": pid, "gate": gate})
+                    if isinstance(verify, bool):
+                        gate_mgr.set_project_verify(pid, verify)
+                    r = JSONResponse({"saved": True, "project_id": pid, "gate": gate,
+                                      "verify": gate_mgr.get_project_verify(pid)})
 
                 elif path.endswith("/ticket"):
                     tid = body.get("ticket_id")
-                    gate = body.get("gate")  # may be None to reset
-                    if not isinstance(tid, str) or (gate is not None and gate not in ("human", "ai")):
+                    gate = body.get("gate")  # may be None to reset; absent = don't touch
+                    verify = body.get("verify")  # may be bool or None to reset; absent = don't touch
+                    if not isinstance(tid, str) or not tid or (
+                        "gate" in body and gate is not None and gate not in ("human", "ai")
+                    ):
                         r = JSONResponse(
                             {"error": "ticket_id (str) and gate ('human'|'ai'|null) required"},
                             status_code=400,
                         )
                         r.headers["Access-Control-Allow-Origin"] = "*"
                         return r
-                    gate_mgr.set_ticket_gate(str(tid), gate)
-                    r = JSONResponse({"saved": True, "ticket_id": tid, "gate": gate})
+                    # Only persist fields that were explicitly included in the request body.
+                    if "gate" in body:
+                        gate_mgr.set_ticket_gate(str(tid), gate)
+                    if "verify" in body and (verify is None or isinstance(verify, bool)):
+                        gate_mgr.set_ticket_verify(str(tid), verify)
+                    r = JSONResponse({"saved": True, "ticket_id": tid, "gate": gate,
+                                      "verify": gate_mgr.get_ticket_verify(str(tid))})
 
                 else:
                     r = JSONResponse({"error": "use /api/gate-setting/project or /ticket"}, status_code=404)
@@ -3539,6 +3551,13 @@ function save() {{
                 if pid is not None and tid_str
                 else (ticket_gate or project_gate or "human")
             )
+            project_verify = gate_mgr.get_project_verify(pid) if pid is not None else None
+            ticket_verify = gate_mgr.get_ticket_verify(tid_str) if tid_str else None
+            effective_verify = (
+                gate_mgr.get_effective_verify(tid_str, pid)
+                if pid is not None and tid_str
+                else (ticket_verify if ticket_verify is not None else (project_verify or False))
+            )
 
             r = JSONResponse({
                 "project_id": pid,
@@ -3546,6 +3565,9 @@ function save() {{
                 "project_gate": project_gate,
                 "ticket_gate": ticket_gate,
                 "effective": effective,
+                "project_verify": project_verify,
+                "ticket_verify": ticket_verify,
+                "effective_verify": effective_verify,
             })
             r.headers["Access-Control-Allow-Origin"] = "*"
             return r
