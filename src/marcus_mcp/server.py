@@ -623,11 +623,6 @@ class MarcusServer:
 
                 # Project synced - don't print as it interferes with MCP
 
-        # Initialize event visualizer if available
-        if self.event_visualizer:
-            # EventIntegratedVisualizer doesn't have initialize method
-            pass
-
         # Wrap AI engine for token tracking
         self.ai_engine = ai_usage_middleware.wrap_ai_provider(self.ai_engine)
 
@@ -3247,6 +3242,12 @@ if __name__ == "__main__":
 
         from src.core.kanboard_webhook_receiver import KanboardWebhookReceiver
 
+        if server.events is None:
+            raise RuntimeError(
+                "Kanboard webhook mode requires the Events system, but it was not "
+                "initialized. Ensure 'features.events' is enabled in your Marcus "
+                "configuration."
+            )
         _webhook_receiver = KanboardWebhookReceiver(
             events=server.events,
             provider=server.provider,
@@ -3777,9 +3778,9 @@ function save() {{
             depends_labels = {"is blocked by", "is a child of", "depends on"}
             blocks_labels  = {"blocks", "is a parent of"}
 
-            depends_on: list = []
-            blocks: list = []
-            relates_to: list = []
+            depends_on: list[dict[str, str]] = []
+            blocks: list[dict[str, str]] = []
+            relates_to: list[dict[str, str]] = []
 
             for link in raw_links:
                 label = (link.get("label") or "").lower().strip()

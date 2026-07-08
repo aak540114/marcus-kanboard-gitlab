@@ -118,7 +118,7 @@ def resolve_decomposer(
     if env_value is not None:
         if env_value in VALID_DECOMPOSERS:
             logger.info(f"[decomposer] Using '{env_value}' from {ENV_VAR}")
-            validated_env: DecomposerStrategy = env_value  # type: ignore[assignment]
+            validated_env: DecomposerStrategy = env_value
             return validated_env
         logger.warning(
             f"[decomposer] Unknown strategy '{env_value}' in {ENV_VAR}; "
