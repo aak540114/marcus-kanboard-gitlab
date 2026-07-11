@@ -21,7 +21,7 @@
 #
 # One-time Gitea admin setup (INSTALL_LOCK skips the web installer wizard,
 # so there is no default admin account yet):
-#   docker compose exec gitea gitea admin user create \
+#   docker compose exec -u git gitea gitea admin user create \
 #     --username root --password Marcus123! \
 #     --email root@example.com --admin --must-change-password=false
 #

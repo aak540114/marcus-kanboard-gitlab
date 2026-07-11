@@ -37,7 +37,7 @@
 # ---------------
 # 1. Create the admin account (INSTALL_LOCK skips the web installer, so
 #    there is no default admin user yet):
-#      docker compose exec gitea gitea admin user create \
+#      docker compose exec -u git gitea gitea admin user create \
 #        --username root --password <choose-a-password> \
 #        --email root@example.com --admin --must-change-password=false
 # 2. Visit $GITEA_EXTERNAL_URL — log in as root

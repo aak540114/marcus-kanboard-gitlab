@@ -117,10 +117,10 @@ docker compose logs -f gitea | grep "Listen"
 
 ### 3. First-time Gitea setup
 
-`docker-compose.yml` sets `GITEA__security__INSTALL_LOCK=true`, which skips Gitea's web installer wizard — but that also means no admin account exists yet. Create one:
+`docker-compose.yml` sets `GITEA__security__INSTALL_LOCK=true`, which skips Gitea's web installer wizard — but that also means no admin account exists yet. Create one (note `-u git`: the Gitea CLI refuses to run admin commands as root, and `docker compose exec` defaults to root unless told otherwise):
 
 ```bash
-docker compose exec gitea gitea admin user create \
+docker compose exec -u git gitea gitea admin user create \
   --username root --password Marcus123! \
   --email root@example.com --admin --must-change-password=false
 ```
