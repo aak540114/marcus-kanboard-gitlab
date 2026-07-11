@@ -127,7 +127,18 @@ def call_rpc(
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                body = json.loads(resp.read())
+                raw = resp.read()
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                # Kanboard can briefly return a non-JSON page (e.g. a
+                # session/error page) in the narrow window after its TCP
+                # healthcheck passes but before jsonrpc.php is fully
+                # serving — treat like a connection error and retry.
+                last_exc = exc
+                if attempt < retries - 1:
+                    time.sleep(retry_delay)
+                continue
             if "error" in body:
                 raise KanboardRPCError(f"{method}: {body['error']}")
             return body.get("result")
@@ -168,21 +179,22 @@ def find_or_create_project(base_url: str, token: str, name: str) -> int:
     Raises
     ------
     KanboardRPCError
-        If ``createProject`` reports success but the project still can't
-        be found afterward.
+        If ``createProject`` returns a falsy result (Kanboard's own
+        ``ProjectModel::create`` returns ``false`` on any failure step).
     """
     project = call_rpc(base_url, token, "getProjectByName", [name])
     if project:
         return int(project["id"])
 
-    call_rpc(base_url, token, "createProject", [name])
-    project = call_rpc(base_url, token, "getProjectByName", [name])
-    if not project:
-        raise KanboardRPCError(
-            f"createProject({name!r}) reported success but getProjectByName "
-            f"still returned nothing"
-        )
-    return int(project["id"])
+    # createProject's JSON-RPC result IS the new project's int id on
+    # success (ProjectProcedure::createProject returns
+    # ProjectModel::create()'s return value directly) — no need for a
+    # second getProjectByName round-trip just to re-fetch what we
+    # already received.
+    result = call_rpc(base_url, token, "createProject", [name])
+    if not result:
+        raise KanboardRPCError(f"createProject({name!r}) returned a falsy result")
+    return int(result)
 
 
 def reconcile_columns(

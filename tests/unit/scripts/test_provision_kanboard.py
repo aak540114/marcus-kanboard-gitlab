@@ -29,6 +29,7 @@ def _rpc_response(result) -> MagicMock:
 
 
 def _rpc_error(message: str) -> MagicMock:
+    """Build a mock urlopen() context manager returning a JSON-RPC error field."""
     body = json.dumps(
         {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": message}}
     ).encode()
@@ -39,15 +40,26 @@ def _rpc_error(message: str) -> MagicMock:
     return resp
 
 
+def _non_json_response() -> MagicMock:
+    """Build a mock urlopen() returning a non-JSON body (e.g. a stray HTML page)."""
+    resp = MagicMock()
+    resp.read = MagicMock(return_value=b"<html>not json</html>")
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+
 class TestCallRpc:
     """call_rpc() — the single HTTP seam used by everything else."""
 
     def test_returns_result_on_success(self):
+        """A clean JSON-RPC response returns its `result` field."""
         with patch("provision_kanboard.urllib.request.urlopen", return_value=_rpc_response(42)):
             result = pk.call_rpc("http://x/jsonrpc.php", "tok", "getVersion")
         assert result == 42
 
     def test_sends_basic_auth_as_jsonrpc_user(self):
+        """Auth is HTTP Basic as user 'jsonrpc' with the token as password."""
         captured = {}
 
         def fake_urlopen(req, timeout=None):
@@ -63,6 +75,7 @@ class TestCallRpc:
         assert captured["auth"] == expected
 
     def test_raises_auth_error_on_401_without_retry(self):
+        """HTTP 401 raises immediately — a bad token won't fix itself by waiting."""
         call_count = {"n": 0}
 
         def fake_urlopen(req, timeout=None):
@@ -76,6 +89,7 @@ class TestCallRpc:
         assert call_count["n"] == 1  # no retry on auth failure
 
     def test_raises_auth_error_on_403(self):
+        """HTTP 403 is treated the same as 401 — an auth failure, not retried."""
         def fake_urlopen(req, timeout=None):
             raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, None)
 
@@ -84,6 +98,7 @@ class TestCallRpc:
                 pk.call_rpc("http://x/jsonrpc.php", "bad-tok", "getVersion")
 
     def test_retries_connection_error_then_succeeds(self):
+        """Transient connection errors are retried and a later success wins."""
         responses = iter(
             [
                 urllib.error.URLError("connection refused"),
@@ -106,6 +121,7 @@ class TestCallRpc:
         assert result == "ok"
 
     def test_gives_up_after_max_retries(self):
+        """A connection error on every attempt exhausts retries and raises."""
         def fake_urlopen(req, timeout=None):
             raise urllib.error.URLError("connection refused")
 
@@ -116,15 +132,47 @@ class TestCallRpc:
                 pk.call_rpc("http://x/jsonrpc.php", "tok", "getVersion", retries=3, retry_delay=0)
 
     def test_raises_rpc_error_on_error_field(self):
+        """A JSON-RPC response with an `error` field raises KanboardRPCError."""
         with patch(
             "provision_kanboard.urllib.request.urlopen", return_value=_rpc_error("Invalid params")
         ):
             with pytest.raises(pk.KanboardRPCError):
                 pk.call_rpc("http://x/jsonrpc.php", "tok", "createProject")
 
+    def test_retries_non_json_response_then_succeeds(self):
+        """A non-JSON body (e.g. a stray session/error page) is retried, not fatal.
+
+        Regression test: json.JSONDecodeError previously wasn't caught by
+        either except clause and propagated as a raw traceback, skipping
+        the retry loop entirely.
+        """
+        responses = iter([_non_json_response(), _rpc_response("ok")])
+
+        def fake_urlopen(req, timeout=None):
+            return next(responses)
+
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=fake_urlopen), patch(
+            "provision_kanboard.time.sleep"
+        ):
+            result = pk.call_rpc("http://x/jsonrpc.php", "tok", "getVersion", retries=3, retry_delay=0)
+
+        assert result == "ok"
+
+    def test_gives_up_after_max_retries_on_persistent_non_json(self):
+        """A non-JSON body on every attempt exhausts retries and raises cleanly."""
+        with patch(
+            "provision_kanboard.urllib.request.urlopen", return_value=_non_json_response()
+        ), patch("provision_kanboard.time.sleep"):
+            with pytest.raises(pk.KanboardRPCError):
+                pk.call_rpc("http://x/jsonrpc.php", "tok", "getVersion", retries=3, retry_delay=0)
+
 
 class TestFindOrCreateProject:
+    """find_or_create_project() — check-then-create, using createProject's
+    own return value instead of a redundant re-fetch."""
+
     def test_returns_existing_project_id_without_creating(self):
+        """An existing project is found and returned with a single RPC call."""
         responses = [_rpc_response({"id": "7", "name": "Marcus Project"})]
 
         with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses) as m:
@@ -134,22 +182,25 @@ class TestFindOrCreateProject:
         assert m.call_count == 1  # only getProjectByName — no createProject call
 
     def test_creates_project_when_missing(self):
+        """A missing project is created; the id comes from createProject's
+        own return value, not a second getProjectByName lookup."""
         responses = [
             _rpc_response(False),  # getProjectByName: not found
-            _rpc_response(True),  # createProject
-            _rpc_response({"id": "3", "name": "Marcus Project"}),  # getProjectByName again
+            _rpc_response(3),  # createProject returns the new int id directly
         ]
 
-        with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses):
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses) as m:
             project_id = pk.find_or_create_project("http://x/jsonrpc.php", "tok", "Marcus Project")
 
         assert project_id == 3
+        assert m.call_count == 2  # getProjectByName + createProject only
 
-    def test_raises_if_create_did_not_take(self):
+    def test_raises_if_create_returns_falsy(self):
+        """createProject returning a falsy result (Kanboard's own failure
+        signal) raises rather than silently returning a bad id."""
         responses = [
-            _rpc_response(False),
-            _rpc_response(True),
-            _rpc_response(False),  # still not found after creation attempt
+            _rpc_response(False),  # getProjectByName: not found
+            _rpc_response(False),  # createProject failed
         ]
 
         with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses):
@@ -158,7 +209,10 @@ class TestFindOrCreateProject:
 
 
 class TestReconcileColumns:
+    """reconcile_columns() — idempotent rename-defaults + add-missing."""
+
     def test_renames_default_columns_and_adds_missing(self):
+        """Fresh project: Backlog/Work in progress are renamed, the rest added."""
         columns = [
             {"id": "1", "title": "Backlog"},
             {"id": "2", "title": "Ready"},
@@ -186,6 +240,7 @@ class TestReconcileColumns:
         assert not any(c[1] and c[1][0] == "2" for c in calls if c[0] == "updateColumn")
 
     def test_idempotent_noop_when_all_required_columns_present(self):
+        """Re-running against an already-reconciled project makes zero calls."""
         columns = [
             {"id": "1", "title": "Todo"},
             {"id": "2", "title": "Ready"},
@@ -258,7 +313,10 @@ class TestReconcileColumns:
 
 
 class TestMain:
+    """main() — CLI entry point: stdout hygiene and exit codes."""
+
     def test_prints_project_id_and_returns_zero_on_success(self, capsys):
+        """On success, stdout is exactly the bare project id (nothing else)."""
         with patch("provision_kanboard.find_or_create_project", return_value=5), patch(
             "provision_kanboard.reconcile_columns", return_value=[]
         ):
@@ -268,6 +326,7 @@ class TestMain:
         assert capsys.readouterr().out.strip() == "5"
 
     def test_returns_one_on_auth_error(self, capsys):
+        """An auth error exits 1 with the message on stderr, not stdout."""
         with patch(
             "provision_kanboard.find_or_create_project",
             side_effect=pk.KanboardAuthError("bad token"),
@@ -278,6 +337,7 @@ class TestMain:
         assert "bad token" in capsys.readouterr().err
 
     def test_returns_one_on_rpc_error(self, capsys):
+        """A generic RPC error (e.g. exhausted retries) exits 1."""
         with patch(
             "provision_kanboard.find_or_create_project",
             side_effect=pk.KanboardRPCError("connection failed"),

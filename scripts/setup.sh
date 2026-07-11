@@ -41,7 +41,14 @@ touch "$ENV_FILE"
 
 env_get() {
     local key="$1"
-    grep "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d'=' -f2-
+    # "not found" is a normal outcome for this helper, not an error — the
+    # trailing `|| true` stops a missing key's non-zero grep/pipefail exit
+    # from propagating through a bare `var="$(env_get X)"` assignment and
+    # killing the whole script under `set -e` (unlike `[ -z "$(env_get X)" ]`
+    # checks, a bare assignment's exit status IS the substitution's exit
+    # status, and that's exactly what happens for GITEA_TOKEN on a
+    # brand-new .env before it's ever been generated).
+    grep "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d'=' -f2- || true
 }
 
 env_set() {
@@ -113,33 +120,11 @@ fi
 # ---------------------------------------------------------------------
 
 log "Starting Kanboard and Gitea..."
-docker compose up -d kanboard gitea
-
-wait_healthy() {
-    local service="$1" timeout="${2:-120}" waited=0 cid status
-    log "Waiting for $service to become healthy (timeout ${timeout}s)..."
-    while true; do
-        cid="$(docker compose ps -q "$service")"
-        status="starting"
-        if [ -n "$cid" ]; then
-            status="$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo starting)"
-        fi
-        if [ "$status" = "healthy" ]; then
-            log "$service is healthy."
-            return 0
-        fi
-        if [ "$waited" -ge "$timeout" ]; then
-            err "$service did not become healthy within ${timeout}s (last status: $status)"
-            docker compose logs "$service" --tail=50 || true
-            return 1
-        fi
-        sleep 2
-        waited=$((waited + 2))
-    done
-}
-
-wait_healthy kanboard 120
-wait_healthy gitea 120
+if ! docker compose up -d --wait --wait-timeout 120 kanboard gitea; then
+    err "Kanboard and/or Gitea did not become healthy in time."
+    docker compose logs kanboard gitea --tail=50 || true
+    exit 1
+fi
 
 # ---------------------------------------------------------------------
 # 4. Provision the Kanboard project + columns.
@@ -163,7 +148,13 @@ log "Kanboard project id: $project_id"
 # ---------------------------------------------------------------------
 
 log "Seeding Kanboard webhook..."
-docker compose exec -T kanboard php -r '
+webhook_seeded="false"
+for webhook_attempt in 1 2 3 4 5; do
+    # SQLite allows one writer at a time; Kanboard's own PHP process can
+    # briefly hold the lock right after the healthcheck passes (session
+    # writes, first-boot migrations still settling). Retry a few times
+    # rather than treat a transient "database is locked" as fatal.
+    if docker compose exec -T kanboard php -r '
 $token = $argv[1];
 $pdo = new PDO("sqlite:/var/www/app/data/db.sqlite");
 $stmt = $pdo->prepare(
@@ -172,7 +163,17 @@ $stmt = $pdo->prepare(
 );
 $stmt->execute(["webhook_url", "http://marcus:4298/webhooks/kanboard"]);
 $stmt->execute(["webhook_token", $token]);
-' -- "$(env_get KANBOARD_WEBHOOK_TOKEN)"
+' -- "$(env_get KANBOARD_WEBHOOK_TOKEN)"; then
+        webhook_seeded="true"
+        break
+    fi
+    log "Webhook seed attempt $webhook_attempt failed (likely a transient SQLite lock) — retrying..."
+    sleep 2
+done
+if [ "$webhook_seeded" != "true" ]; then
+    err "Could not seed the Kanboard webhook after 5 attempts."
+    exit 1
+fi
 log "Webhook configured: http://marcus:4298/webhooks/kanboard"
 
 # ---------------------------------------------------------------------
@@ -185,7 +186,7 @@ if ! docker compose exec -T -u git gitea gitea admin user create \
         --username root --password "$(env_get GITEA_ADMIN_PASSWORD)" \
         --email root@example.com --admin --must-change-password=false \
         > "$create_log" 2>&1; then
-    if grep -qi "already exists" "$create_log"; then
+    if grep -qi "user already exists" "$create_log"; then
         log "Gitea admin account already exists — skipping."
     else
         err "Failed to create Gitea admin account:"
@@ -223,8 +224,11 @@ fi
 # ---------------------------------------------------------------------
 
 log "Building and starting Marcus..."
-docker compose up -d --build marcus
-wait_healthy marcus 60
+if ! docker compose up -d --build --wait --wait-timeout 60 marcus; then
+    err "Marcus did not become healthy in time — most likely a bad CLAUDE_API_KEY or a KANBOARD_API_TOKEN mismatch."
+    docker compose logs marcus --tail=50 || true
+    exit 1
+fi
 
 # ---------------------------------------------------------------------
 # 8. Summary.

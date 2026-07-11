@@ -39,7 +39,14 @@ services:
       # Bind-mount the plugin from source so edits are immediately testable
       - ./kanboard/plugins:/var/www/app/plugins
     environment:
-      MARCUS_URL: "${MARCUS_URL:-http://marcus:4298}"
+      # Browser-facing — embedded server-side into client-side fetch() URLs
+      # by kanboard/plugins/MarcusDevEnv/Template/{board,task}/*.html.php
+      # (Active Agents badge, Project Description link, Gate toggle). Must
+      # be an address the user's own browser can resolve, NOT the Docker
+      # service name "marcus" (unreachable from outside the compose
+      # network). Tracks MARCUS_PORT so the host-published port stays in
+      # sync if that's overridden.
+      MARCUS_URL: "${MARCUS_URL:-http://localhost:${MARCUS_PORT:-4298}}"
       KANBOARD_WEBHOOK_TOKEN: "${KANBOARD_WEBHOOK_TOKEN:-}"
       # Sets the app-level JSON-RPC API token to a known value so
       # scripts/setup.sh can provision Kanboard without any UI login —
@@ -110,14 +117,33 @@ services:
       # Container-to-container URLs use Docker service names, not
       # localhost. Note Kanboard listens on port 80 *inside* the compose
       # network — 8080 above is only the host-side port mapping.
-      KANBAN_PROVIDER: kanboard
+      #
+      # No KANBAN_PROVIDER here deliberately: docker/marcus.docker.config.json
+      # already bakes "kanban": {"provider": "kanboard"} into the image, and
+      # KanbanSettings.provider defaults to "sqlite" (a truthy string) —
+      # kanban_factory.py's `config.kanban.provider or os.getenv(...)`
+      # fallback only ever consults the env var when the config value is
+      # falsy, which it never is here. Setting KANBAN_PROVIDER would be
+      # silently ignored; the baked config file is the actual source of
+      # truth for provider selection in this deployment.
       KANBOARD_URL: "http://kanboard/jsonrpc.php"
       KANBOARD_API_TOKEN: "${KANBOARD_API_TOKEN:-}"
       KANBOARD_PROJECT_ID: "${KANBOARD_PROJECT_ID:-1}"
+      # Validates incoming webhook requests — see
+      # src/core/kanboard_webhook_receiver.py. Must match the value seeded
+      # into Kanboard's own webhook_token setting by scripts/setup.sh.
+      KANBOARD_WEBHOOK_TOKEN: "${KANBOARD_WEBHOOK_TOKEN:-}"
+      # GITEA_URL/GITEA_TOKEN: provisioned by scripts/setup.sh and correct,
+      # but not yet consumed by anything in src/ — GiteaManager and
+      # ProjectSyncWorkflow (src/integrations/gitea_manager.py,
+      # src/workflows/project_sync_workflow.py) exist and are tested but
+      # aren't instantiated by server.py yet. Setting these now is
+      # forward-compatible with that wiring landing later; it is not a
+      # currently-functioning feature. See README.md's Gitea integration
+      # row for the full explanation.
       GITEA_URL: "http://gitea:3000"
       GITEA_TOKEN: "${GITEA_TOKEN:-}"
       CLAUDE_API_KEY: "${CLAUDE_API_KEY:-}"
-      MARCUS_URL: "http://marcus:4298"
     healthcheck:
       # /mcp is a Streamable-HTTP JSON-RPC endpoint (POST-only) — a plain
       # `curl -f GET` would 4xx and falsely report unhealthy. A bare TCP

@@ -18,9 +18,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Cache the dependency layer separately from source so `docker compose
-# restart marcus` after a src/ edit doesn't reinstall everything.
+# Install dependencies from requirements.txt (mirrors [project.dependencies]
+# in pyproject.toml — see that file's header comment) BEFORE copying src/,
+# so a source-only change doesn't invalidate this layer and force a full
+# dependency re-resolve/re-download on every `docker compose up -d --build
+# marcus`. Deliberately not the `embeddings` extra — pulls sentence-
+# transformers/torch, unneeded for this deployment.
 COPY pyproject.toml requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY src ./src
 
 # Template config file — every value is a bare "${VAR}" placeholder,
@@ -30,15 +36,20 @@ COPY src ./src
 # is baked in rather than volume-mounted.
 COPY docker/marcus.docker.config.json ./config_marcus.json
 
-# Core dependencies only. Deliberately NOT `pip install -e ".[embeddings]"`
-# — that extra pulls sentence-transformers/torch, unneeded for this
-# deployment and would roughly double the image size and build time.
-RUN pip install --no-cache-dir -e .
+# Register the local package as editable without re-resolving dependencies
+# (already installed above) — this step is cheap and safe to re-run on
+# every source change.
+RUN pip install --no-cache-dir --no-deps -e .
 
 EXPOSE 4298
 
-# --http forces HTTP transport regardless of config_marcus.json's
-# transport.type (src/marcus_mcp/server.py's main() checks this flag
-# explicitly). Kanban provider selection comes from the KANBAN_PROVIDER
-# environment variable set in docker-compose.yml, not a CLI flag.
-CMD ["marcus", "--http"]
+# Deliberately NOT the installed `marcus` console-script entry point
+# (cli_main -> main() in src/marcus_mcp/server.py): that path only builds
+# a bare FastMCP app and skips the custom Starlette routes this stack
+# depends on (/webhooks/kanboard, /api/gate-setting, /dev-env/*,
+# /project-description) — those are only registered inside server.py's
+# `if __name__ == "__main__":` block. Running the module directly via -m
+# triggers that block instead, so --http here still forces HTTP transport
+# via the same sys.argv check, just through the code path that actually
+# has the routes scripts/setup.sh provisions (e.g. the webhook it seeds).
+CMD ["python", "-m", "src.marcus_mcp.server", "--http"]
