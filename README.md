@@ -17,6 +17,8 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | **Project Description system** | Per-project markdown doc that AI agents read to learn the tech stack; editable from the board |
 | **Human Gate / AI Gate toggle** | Per-project and per-ticket control over whether humans review AI work before it merges |
 | **AI Verify** | Configurable N-round LLM code review before any AI-gate merge; each round posts a comment with findings; agent fixes issues between rounds; 0 rounds = disabled |
+| **Claude subscription provider** | Marcus's own planner calls (decomposition, dependency inference, effort estimation) can run through a locally logged-in `claude` CLI instead of a metered API key — see [AI provider](#ai-provider). No `CLAUDE_API_KEY` prompt during setup. |
+| **Remote agents + auth** | Opt in during setup to let AI agents on other machines connect; access is gated by a bearer token so unaccounted agents are rejected, with optional built-in HTTPS — see [Authenticating remote agents](#authenticating-remote-agents). |
 
 ---
 
@@ -29,6 +31,7 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | [Gitea](https://about.gitea.com) | Self-hosted git — one repo per project, one branch per ticket. A single lightweight Go binary, chosen over GitLab CE for its low resource footprint |
 | Python 3.11+ | Marcus server runtime |
 | Docker / Docker Compose | Runs Kanboard and Gitea; dev containers for hot-reload previews |
+| [Caddy](https://caddyserver.com) | Optional TLS reverse proxy (`docker-compose.tls.yml`) — auto HTTPS for remote agents via Let's Encrypt |
 | [MCP](https://modelcontextprotocol.io) | Protocol agents use to talk to Marcus (Claude Code, Codex, Gemini CLI, etc.) |
 
 ---
@@ -72,6 +75,7 @@ gitea (container, host port 3000) ──── gitea — branch per ticket
 
 AI agents (Claude Code, Codex, etc.)
   └── connect to http://localhost:4298/mcp  (MCP protocol)
+      │   (remote agents: + Authorization: Bearer <MARCUS_AGENT_TOKEN>)
       ├── request_next_task
       ├── signal_ready_for_review    → Human Gate: "Waiting for Human"
       │                              → AI Gate:    auto-merge + "Done"
@@ -300,10 +304,12 @@ AI Verify adds an independent LLM code-review step to the AI Gate auto-merge pat
 
 ## HTTP endpoints
 
+When `MARCUS_AGENT_TOKEN` is set (automatic once you allow remote access — see [Authenticating remote agents](#authenticating-remote-agents)), **every** endpoint below except `/webhooks/kanboard` requires an `Authorization: Bearer <token>` header and returns `401` without it. `/webhooks/kanboard` authenticates separately with its own `?token=` secret that Kanboard sends. With no token set (localhost-only default), all endpoints are open.
+
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/mcp` | GET/POST | MCP protocol — all AI agent tooling |
-| `/webhooks/kanboard` | POST | Receives Kanboard push webhooks |
+| `/webhooks/kanboard` | POST | Receives Kanboard push webhooks (own `?token=` auth) |
 | `/dev-env/view?ticket_id=<id>&project_id=<id>` | GET | Starts hot-reload dev environment, redirects to preview URL |
 | `/dev-env/stop?ticket_id=<id>` | POST | Tears down a running dev environment |
 | `/api/dev-env/status?ticket_id=<id>` | GET | Returns `{running, url}` for a ticket's dev environment |
@@ -327,6 +333,9 @@ Each service deploys independently:
 | Kanboard only | `kanboard/docker-compose.yml` | Railway, Fly.io, any VPS |
 | Gitea only | `gitea/docker-compose.yml` | Any small VPS (≥ 512 MB RAM) |
 | Marcus only | `Dockerfile` (root), or `pip install -e .` + `python -m marcus --http` locally | A cloud VM, or CI, pointed at remote Kanboard/Gitea instances |
+| Marcus + HTTPS proxy | `docker-compose.yml` + `docker-compose.tls.yml` overlay (Caddy) | A cloud VPS with a public domain, for remote agents over TLS |
+
+When Marcus runs apart from the agents that connect to it, set `MARCUS_AGENT_TOKEN` so only authorized agents can reach it, and prefer the HTTPS overlay (or a VPN/tunnel) so the token isn't sent in cleartext — see [Authenticating remote agents](#authenticating-remote-agents).
 
 **Railway (Kanboard):** push to GitHub, create a Railway service pointing at `kanboard/`, set environment variables in the Railway dashboard. Railway reads `kanboard/railway.toml` automatically.
 
