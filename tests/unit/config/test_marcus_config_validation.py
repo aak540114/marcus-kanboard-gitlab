@@ -267,6 +267,27 @@ class TestMarcusConfigValidation:
         config = MarcusConfig.from_file(str(config_file))
         config.validate()  # must not raise
 
+    def test_validation_allows_empty_provider(self, tmp_path: Path) -> None:
+        """An empty/unset provider (e.g. a ${MARCUS_AI_PROVIDER} placeholder
+        that resolved to None) must NOT be rejected as 'unrecognized' — that
+        would crash get_config() at import. It falls through to downstream
+        default/auto-discovery instead."""
+        config_file = tmp_path / "test_config.json"
+        config_data = {
+            "ai": {"provider": ""},
+            "kanban": {
+                "provider": "planka",
+                "planka_base_url": "http://localhost:3333",
+                "planka_email": "test@test.com",
+                "planka_password": "testpass",  # pragma: allowlist secret
+            },
+        }
+        with open(config_file, "w") as f:
+            json.dump(config_data, f)
+
+        config = MarcusConfig.from_file(str(config_file))
+        config.validate()  # must not raise
+
     def test_validation_fails_for_unknown_provider(self, tmp_path: Path) -> None:
         """A typo'd/unrecognized provider must be rejected up front with a
         clear message, not pass validation and fail cryptically later."""

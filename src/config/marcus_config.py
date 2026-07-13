@@ -732,7 +732,13 @@ class MarcusConfig:
                 "local",
                 "claude_subscription",
             }
-            if self.ai.provider not in _known_providers:
+            # Only reject a *non-empty* unrecognized name (a real typo like
+            # "anthorpic"). A None/empty provider means "unset" — e.g. a
+            # ``${MARCUS_AI_PROVIDER}`` placeholder that resolved to None
+            # because the env var wasn't set — and must fall through to the
+            # existing default/auto-discovery behavior downstream, not
+            # hard-fail here (that would crash get_config() at import time).
+            if self.ai.provider and self.ai.provider not in _known_providers:
                 errors.append(
                     f"AI provider '{self.ai.provider}' is not recognized. "
                     f"Valid values: {', '.join(sorted(_known_providers))}."
