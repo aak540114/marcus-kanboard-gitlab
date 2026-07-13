@@ -138,6 +138,33 @@ mkdir -p "$HOME/.claude"
 [ -f "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
 [ -f "$HOME/.claude/.credentials.json" ] || echo '{}' > "$HOME/.claude/.credentials.json"
 
+log "Configuring network access..."
+
+if [ -z "$(env_get MARCUS_BIND_HOST)" ]; then
+    if [ -t 0 ]; then
+        read -r -p "Allow AI agents on OTHER machines (e.g. a remote VPS) to connect to Marcus? [y/N]: " allow_remote
+        case "$allow_remote" in
+            [yY]|[yY][eE][sS])
+                env_set MARCUS_BIND_HOST "0.0.0.0"
+                log "Marcus's port will be published on all interfaces — reachable from other machines once your firewall/network allows it."
+                ;;
+            *)
+                env_set MARCUS_BIND_HOST "127.0.0.1"
+                log "Marcus's port will only be reachable from this machine (127.0.0.1)."
+                ;;
+        esac
+    else
+        # No terminal to ask with — default to the safe choice
+        # (localhost-only) instead of guessing "yes" and exposing a port
+        # to the network without the operator explicitly opting in.
+        env_set MARCUS_BIND_HOST "127.0.0.1"
+        log "No terminal available to ask — defaulting to localhost-only access (127.0.0.1)."
+        log "Set MARCUS_BIND_HOST=0.0.0.0 in .env before re-running to allow remote agents instead."
+    fi
+else
+    log "MARCUS_BIND_HOST=$(env_get MARCUS_BIND_HOST) already set in .env — leaving it as-is."
+fi
+
 # ---------------------------------------------------------------------
 # 3. Start Kanboard + Gitea only — Marcus needs values these produce.
 # ---------------------------------------------------------------------
@@ -275,10 +302,17 @@ echo
 echo " Connect an AI agent from this machine:"
 echo "   claude mcp add --transport http marcus http://localhost:${host_port}/mcp"
 echo
-echo " Connect an AI agent from another machine (Marcus listens on 0.0.0.0"
-echo " inside the container, mapped to this host's port ${host_port} —"
-echo " reachable from elsewhere once your firewall/network allows it):"
-echo "   claude mcp add --transport http marcus http://<this-machine's-address>:${host_port}/mcp"
+
+bind_host="$(env_get MARCUS_BIND_HOST)"
+if [ "$bind_host" = "0.0.0.0" ]; then
+    echo " Remote access: ENABLED — reachable from other machines on port ${host_port}"
+    echo " once your firewall/network allows it. Connect an AI agent from another machine:"
+    echo "   claude mcp add --transport http marcus http://<this-machine's-address>:${host_port}/mcp"
+else
+    echo " Remote access: DISABLED — Marcus only accepts connections from this machine."
+    echo " To allow AI agents on other machines to connect, set MARCUS_BIND_HOST=0.0.0.0"
+    echo " in .env and re-run: docker compose up -d --build marcus"
+fi
 echo
 echo " Save the Gitea admin password above if you plan to log in manually —"
 echo " it won't be printed again (it's also in .env, which is git-ignored)."

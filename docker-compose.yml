@@ -101,7 +101,16 @@ services:
       gitea:
         condition: service_healthy
     ports:
-      - "${MARCUS_PORT:-4298}:4298"
+      # MARCUS_BIND_HOST controls whether this port is reachable from
+      # other machines: "127.0.0.1" (default, set by scripts/setup.sh
+      # unless you opt in) publishes it to loopback only — unreachable
+      # off this machine even though the container itself always binds
+      # 0.0.0.0 internally (see docker/marcus.docker.config.json's
+      # transport.http.host, required for Docker's own port-forwarding
+      # to work at all). Set to "0.0.0.0" (or leave unset and let
+      # scripts/setup.sh ask) to accept connections from AI agents on
+      # other machines, e.g. a remote VPS deployment.
+      - "${MARCUS_BIND_HOST:-127.0.0.1}:${MARCUS_PORT:-4298}:4298"
     volumes:
       # Bind-mount source for hot-reload-on-restart, matching the
       # kanboard plugin bind-mount convention above (editable install

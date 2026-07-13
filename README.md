@@ -116,6 +116,7 @@ When it finishes it prints the Kanboard/Gitea/Marcus URLs, the Gitea admin passw
 | Gitea admin account | Created non-interactively | `docker compose exec -u git gitea gitea admin user create ...` |
 | Gitea access token | Generated non-interactively | `docker compose exec -u git gitea gitea admin user generate-access-token ...` |
 | AI provider | `claude_subscription` if this machine has an authenticated `claude` CLI; `anthropic` if `CLAUDE_API_KEY` is already in `.env`; otherwise the script fails with instructions instead of prompting | See [AI provider](#ai-provider) |
+| Network access | Asks once: allow AI agents on other machines to connect to Marcus, or localhost-only? Defaults to localhost-only if there's no terminal to ask | See [Network access](#network-access) |
 | Marcus | Built and started once everything above has produced the values it needs | `docker compose up -d --build marcus` |
 
 </details>
@@ -158,13 +159,28 @@ Point any MCP-compatible agent at `http://localhost:4298/mcp`. For Claude Code:
 claude mcp add --transport http marcus http://localhost:4298/mcp
 ```
 
-Marcus listens on `0.0.0.0` inside the container (see `docker/marcus.docker.config.json`'s `transport.http.host`), mapped to this host's `MARCUS_PORT` (default `4298`) — so an agent running on a **different machine** (another laptop, a remote VPS) can connect too, once your firewall/network allows reaching that port:
+This always works from the same machine Marcus runs on. Connecting from a **different machine** (another laptop, a remote VPS) additionally requires you to have opted in during setup — see [Network access](#network-access).
+
+---
+
+## Network access
+
+`./scripts/setup.sh` asks once, interactively: **"Allow AI agents on OTHER machines to connect to Marcus?"** The answer is written to `.env` as `MARCUS_BIND_HOST` and controls which host interface Docker publishes Marcus's port on:
+
+| Answer | `MARCUS_BIND_HOST` | Effect |
+|---|---|---|
+| No (default) | `127.0.0.1` | Marcus only accepts connections from this machine. Nothing changes about how you use it locally — this is the default for a reason: it's the safer choice, and it's what most local/single-machine setups want. |
+| Yes | `0.0.0.0` | Marcus's port is published on all interfaces, reachable from other machines once your firewall/network allows it. |
+
+Answering **Yes** is what a distributed setup needs — Marcus, Kanboard, and Gitea can each run on separate hosts (see [Independent deployment](#independent-deployment)), with AI agents on individual machines all connecting to Marcus's one MCP endpoint over the network:
 
 ```bash
 claude mcp add --transport http marcus http://<this-machine's-address>:4298/mcp
 ```
 
-This is how a distributed setup works — Marcus, Kanboard, and Gitea can each run on separate hosts (see [Independent deployment](#independent-deployment)), with AI agents on individual machines all connecting to Marcus's one MCP endpoint over the network to pull tasks.
+If there's no terminal to ask (e.g. running the script from CI), it defaults to **No** rather than guessing. To change your answer later, edit `MARCUS_BIND_HOST` in `.env` and run `docker compose up -d --build marcus` again — no need to re-run the whole setup script.
+
+Note this only gates the *port-level* reachability of Marcus's MCP endpoint; it doesn't add authentication in front of it. If you open it to other machines, treat it the same as any other unauthenticated network service — restrict it with a firewall/VPN/security group to just the hosts your AI agents actually run on, especially on a cloud VPS.
 
 ---
 
