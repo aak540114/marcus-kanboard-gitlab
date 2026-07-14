@@ -569,6 +569,130 @@ class TestGetWorkContextEnrichedFields:
 
 
 # ---------------------------------------------------------------------------
+# get_work_context: on-demand Gitea repo provisioning via ProjectSyncWorkflow
+# ---------------------------------------------------------------------------
+
+
+class TestGetWorkContextEnsuresRepo:
+    """get_work_context() provisions the Gitea repo on first lookup.
+
+    Nothing in Marcus currently publishes a `project.created` event, so
+    ProjectSyncWorkflow.ensure_repo() is only ever reached this way — a
+    ticket's project must get a repo mapping the first time an agent asks
+    for work context, not stay permanently unset.
+    """
+
+    @pytest.fixture
+    def mock_project_sync(self):
+        ps = MagicMock()
+        ps.get_repo_for_project = MagicMock(return_value=None)
+        ps.ensure_repo = AsyncMock(
+            return_value={
+                "local_repo_path": "./data/repos/shopping-cart",
+                "gitea_repo_url": "http://localhost:3000/root/shopping-cart.git",
+            }
+        )
+        return ps
+
+    @pytest.fixture
+    def workflow_with_sync(
+        self, lifecycle, mock_kanban, mock_branch, mock_dev_env, mock_ac_gen,
+        mock_project_sync,
+    ):
+        events = Events()
+        wf = HumanGatedWorkflow(
+            kanban=mock_kanban,
+            events=events,
+            provider_name="kanboard",
+            lifecycle=lifecycle,
+            branch_manager=mock_branch,
+            dev_env_manager=mock_dev_env,
+            ac_generator=mock_ac_gen,
+            project_sync=mock_project_sync,
+        )
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            yield wf
+
+    @pytest.mark.asyncio
+    async def test_ensure_repo_called_when_no_mapping_exists(
+        self, workflow_with_sync, lifecycle, mock_kanban, mock_project_sync
+    ):
+        """No cached mapping + a resolvable project name → ensure_repo runs."""
+        lifecycle.get_or_create("70", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        mock_kanban.get_project_name = AsyncMock(return_value="Shopping Cart")
+
+        ctx = await workflow_with_sync.get_work_context("70")
+
+        mock_project_sync.ensure_repo.assert_awaited_once_with(9, "Shopping Cart")
+        assert ctx["local_repo_path"] == "./data/repos/shopping-cart"
+        assert ctx["gitea_repo_url"] == "http://localhost:3000/root/shopping-cart.git"
+
+    @pytest.mark.asyncio
+    async def test_ensure_repo_skipped_when_mapping_already_cached(
+        self, workflow_with_sync, lifecycle, mock_kanban, mock_project_sync
+    ):
+        """A cached mapping short-circuits — no repo-creation call at all."""
+        mock_project_sync.get_repo_for_project = MagicMock(
+            return_value={
+                "local_repo_path": "./data/repos/cached",
+                "gitea_repo_url": "http://localhost:3000/root/cached.git",
+            }
+        )
+        lifecycle.get_or_create("71", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+
+        ctx = await workflow_with_sync.get_work_context("71")
+
+        mock_project_sync.ensure_repo.assert_not_called()
+        assert ctx["local_repo_path"] == "./data/repos/cached"
+
+    @pytest.mark.asyncio
+    async def test_skipped_when_kanban_has_no_get_project_name(
+        self, workflow_with_sync, lifecycle, mock_project_sync
+    ):
+        """Provider without get_project_name (non-Kanboard) → no crash, no call."""
+        lifecycle.get_or_create("72", "kanboard")
+        limited_kanban = MagicMock(spec=["get_task_by_id"])
+        limited_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        workflow_with_sync._kanban = limited_kanban
+
+        ctx = await workflow_with_sync.get_work_context("72")
+
+        mock_project_sync.ensure_repo.assert_not_called()
+        assert ctx["local_repo_path"] is None
+
+    @pytest.mark.asyncio
+    async def test_ensure_repo_failure_does_not_crash_get_work_context(
+        self, workflow_with_sync, lifecycle, mock_kanban, mock_project_sync
+    ):
+        """A repo-provisioning failure degrades to no repo info, not an error."""
+        lifecycle.get_or_create("73", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        mock_kanban.get_project_name = AsyncMock(return_value="Shopping Cart")
+        mock_project_sync.ensure_repo = AsyncMock(return_value=None)
+
+        ctx = await workflow_with_sync.get_work_context("73")
+
+        assert ctx["local_repo_path"] is None
+        assert ctx["gitea_repo_url"] is None
+
+    @pytest.mark.asyncio
+    async def test_no_project_sync_wired_leaves_repo_fields_none(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """workflow fixture has no project_sync — unchanged pre-existing behaviour."""
+        lifecycle.get_or_create("74", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        ctx = await workflow.get_work_context("74")
+        assert ctx["local_repo_path"] is None
+        assert ctx["gitea_repo_url"] is None
+
+
+# ---------------------------------------------------------------------------
 # get_project_description
 # ---------------------------------------------------------------------------
 

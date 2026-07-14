@@ -3294,7 +3294,18 @@ if __name__ == "__main__":
                 provider=server.provider,
             )
 
-            await _wire_human_gated_workflow(server)
+            # NOTE: _wire_human_gated_workflow is deliberately NOT called
+            # here. This coroutine runs via a throwaway `asyncio.new_event_loop()`
+            # (see `loop.run_until_complete(setup_http_server())` below) that
+            # is discarded once setup finishes — uvicorn later serves
+            # requests on its OWN event loop (`server_instance.run()`,
+            # far below). HumanGatedWorkflow.start() creates a
+            # long-lived background task (BoardWatcher's poll loop) via
+            # asyncio.create_task(); a task created on this throwaway loop
+            # would never run again once that loop is abandoned. Wiring
+            # is instead done from the Starlette app's `on_startup` hook
+            # (see `app = Starlette(..., on_startup=[...])` below), which
+            # runs on the actual event loop uvicorn keeps alive.
 
             return server
 
@@ -3353,6 +3364,9 @@ if __name__ == "__main__":
         signal.signal(signal.SIGTERM, http_signal_handler)
 
         # Run with uvicorn directly
+        import contextlib
+        from typing import AsyncIterator
+
         import uvicorn
         from starlette.applications import Starlette
         from starlette.requests import Request
@@ -3962,6 +3976,27 @@ function save() {{
             response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
             return response
 
+        @contextlib.asynccontextmanager
+        async def _lifespan(_app: Starlette) -> AsyncIterator[None]:
+            """Wire (and later stop) HumanGatedWorkflow on uvicorn's own event loop.
+
+            Wiring must happen here (Starlette's ``lifespan``), not inside
+            ``setup_http_server()`` above — that coroutine runs on a
+            throwaway ``asyncio.new_event_loop()`` that is discarded before
+            uvicorn starts serving on its own loop. HumanGatedWorkflow.start()
+            schedules a long-lived background task (BoardWatcher's poll
+            loop); creating that task on a loop that gets abandoned a few
+            lines later means it would never run again — the entire
+            ticket-lifecycle polling engine would silently never fire.
+            """
+            await _wire_human_gated_workflow(server)
+            try:
+                yield
+            finally:
+                human_gated_workflow = getattr(server, "_human_gated_workflow", None)
+                if human_gated_workflow is not None:
+                    await human_gated_workflow.stop()
+
         mcp_app = fastmcp.streamable_http_app()
         app = Starlette(
             routes=[
@@ -3977,7 +4012,8 @@ function save() {{
                 Route("/api/gate-setting/project", gate_setting_api, methods=["PUT"]),
                 Route("/api/gate-setting/ticket", gate_setting_api, methods=["PUT"]),
                 Mount("/", app=mcp_app),
-            ]
+            ],
+            lifespan=_lifespan,
         )
 
         # Bearer-token auth: when MARCUS_AGENT_TOKEN is set (scripts/setup.sh

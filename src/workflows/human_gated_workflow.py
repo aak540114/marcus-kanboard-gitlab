@@ -946,11 +946,32 @@ class HumanGatedWorkflow:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not fetch comments for %s: %s", ticket_id, exc)
 
-        # Repo info from ProjectSyncWorkflow (if wired up).
+        # Repo info from ProjectSyncWorkflow (if wired up). Provisioned
+        # on-demand the first time a ticket's project has no mapping yet —
+        # nothing in Marcus currently publishes a `project.created` event
+        # (see ProjectSyncWorkflow.ensure_repo's docstring), so this is the
+        # only path that actually creates the Gitea repo + push webhook.
+        # Subsequent calls just hit the cached mapping below.
         local_repo_path: Optional[str] = None
         gitea_repo_url: Optional[str] = None
         if self._project_sync and kanboard_project_id is not None:
             mapping = self._project_sync.get_repo_for_project(kanboard_project_id)
+            if mapping is None:
+                get_project_name = getattr(self._kanban, "get_project_name", None)
+                if get_project_name is not None:
+                    try:
+                        project_name = await get_project_name(kanboard_project_id)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Could not fetch project name for %d: %s",
+                            kanboard_project_id,
+                            exc,
+                        )
+                        project_name = None
+                    if project_name:
+                        mapping = await self._project_sync.ensure_repo(
+                            kanboard_project_id, project_name
+                        )
             if mapping:
                 local_repo_path = mapping.get("local_repo_path")
                 gitea_repo_url = mapping.get("gitea_repo_url")

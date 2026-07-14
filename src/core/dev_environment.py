@@ -51,6 +51,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from src.core.dev_env_settings import DevEnvSettingsManager
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PORT_RANGE = (9100, 9900)
@@ -172,6 +174,50 @@ def detect_project_type(repo_path: str) -> str:
         return "php"
 
     return "static"
+
+
+def _resolve_host_repo_path(repo_path: str) -> str:
+    """Translate a Marcus-container repo path to the Docker HOST path.
+
+    Marcus itself may run inside a container (Docker-outside-of-Docker):
+    its ``docker run -v`` calls reach the HOST's Docker daemon through a
+    mounted ``/var/run/docker.sock``, so a bind-mount *source* path must
+    be a real host filesystem path — a path inside Marcus's own container
+    namespace (e.g. ``/app/data/repos/x``, from Marcus's own
+    ``./data:/app/data`` bind mount) does not exist there.
+
+    ``MARCUS_HOST_PROJECT_ROOT`` is set by ``docker-compose.yml`` to
+    ``${PWD}`` at ``docker compose up`` time — the host directory
+    Marcus's own ``./data`` is mounted from. When set, this translates
+    ``/app/data/...`` or ``./data/...`` (relative to Marcus's own CWD,
+    which is ``/app``) to ``{MARCUS_HOST_PROJECT_ROOT}/data/...``. Left
+    as-is when unset (local/non-Docker ``./marcus start``, or tests).
+
+    Parameters
+    ----------
+    repo_path : str
+        Repo path as Marcus's own process sees it.
+
+    Returns
+    -------
+    str
+        The equivalent path on the Docker host.
+    """
+    host_root = os.environ.get("MARCUS_HOST_PROJECT_ROOT")
+    if not host_root:
+        return repo_path
+
+    normalized = repo_path
+    if normalized.startswith("/app/"):
+        normalized = normalized[len("/app/") :]
+    elif normalized.startswith("./"):
+        normalized = normalized[2:]
+    elif os.path.isabs(normalized):
+        # Absolute path outside /app — nothing we know how to translate;
+        # use as-is (matches pre-DooD behaviour, may not exist on host).
+        return repo_path
+
+    return os.path.join(host_root, normalized)
 
 
 class PortAllocator:
@@ -314,12 +360,20 @@ class DevEnvironmentManager:
     ----------
     config : Optional[DevEnvironmentConfig]
         Configuration; uses defaults if not provided.
+    settings_manager : Optional[DevEnvSettingsManager]
+        Source of the global max-parallel-containers limit; uses defaults
+        (unlimited unless configured via the Kanboard UI) if not provided.
     """
 
-    def __init__(self, config: Optional[DevEnvironmentConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[DevEnvironmentConfig] = None,
+        settings_manager: Optional[DevEnvSettingsManager] = None,
+    ) -> None:
         """Initialise the manager."""
         self.config = config or DevEnvironmentConfig()
         self._allocator = PortAllocator(self.config.port_range)
+        self._settings = settings_manager or DevEnvSettingsManager()
         self._envs: Dict[str, DevEnvironmentInfo] = (
             {}
         )  # key = f"{provider}:{ticket_id}"
@@ -334,6 +388,7 @@ class DevEnvironmentManager:
         provider: str,
         branch_name: str,
         project_stack: "Optional[Any]" = None,
+        repo_path: Optional[str] = None,
     ) -> DevEnvironmentInfo:
         """Start a dev environment for *branch_name*.
 
@@ -351,11 +406,22 @@ class DevEnvironmentManager:
         project_stack : Optional[ProjectStack]
             Tech-stack parsed from the project description.  Overrides
             file-based detection when supplied.
+        repo_path : Optional[str]
+            Repo path for THIS ticket, overriding ``self.config.repo_path``
+            for this call only.  Required for correctness when one manager
+            instance serves many tickets across different projects/repos
+            (``self.config.repo_path`` is fixed at construction and shared).
 
         Returns
         -------
         DevEnvironmentInfo
             Info about the running environment.
+
+        Raises
+        ------
+        RuntimeError
+            If the configured max-parallel-containers limit has been
+            reached and no environment is already running for this ticket.
         """
         key = f"{provider}:{ticket_id}"
         if key in self._envs:
@@ -364,18 +430,27 @@ class DevEnvironmentManager:
             )
             return self._envs[key]
 
+        limit = self._settings.get_max_parallel_containers()
+        if limit is not None and len(self._envs) >= limit:
+            raise RuntimeError(
+                f"Max parallel dev environments ({limit}) reached — stop an "
+                "existing one before starting a new one."
+            )
+
         port = self._allocator.allocate()
         container_name = f"marcus-dev-{provider}-{ticket_id.lower().replace('/', '-')}"
         url = f"http://{self.config.host}:{port}"
+        effective_repo_path = repo_path or self.config.repo_path
 
         if self.config.use_docker:
             info = await self._start_docker(
                 ticket_id, provider, branch_name, port, container_name, url,
-                project_stack=project_stack,
+                project_stack=project_stack, repo_path=effective_repo_path,
             )
         else:
             info = await self._start_local(
-                ticket_id, provider, branch_name, port, container_name, url
+                ticket_id, provider, branch_name, port, container_name, url,
+                repo_path=effective_repo_path,
             )
 
         self._envs[key] = info
@@ -409,6 +484,63 @@ class DevEnvironmentManager:
 
         self._allocator.release(info.port)
         logger.info("Dev env stopped for %s", key)
+        return True
+
+    async def refresh(self, ticket_id: str, provider: str) -> bool:
+        """Pull the latest branch commit into a running dev-environment container.
+
+        Runs ``git fetch origin && git reset --hard origin/<branch>`` inside
+        the container via ``docker exec``. The container's ``/app`` is
+        bind-mounted from the same host path Marcus/GiteaManager use to
+        manage the repo, and the container's own inotify-restart-loop / HMR
+        watcher (see :meth:`_build_entrypoint`) picks up the file change
+        automatically — this method only needs to trigger the pull, not
+        implement any new reload logic. Intended to be called from the
+        Gitea push-webhook handler for instant refresh.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+
+        Returns
+        -------
+        bool
+            ``True`` if a running Docker environment was found and
+            refreshed. ``False`` if no environment is running for this
+            ticket, the environment is a local (non-Docker) process, or
+            the git commands failed inside the container.
+        """
+        key = f"{provider}:{ticket_id}"
+        info = self._envs.get(key)
+        if info is None:
+            return False
+
+        if not self.config.use_docker:
+            logger.debug("refresh() is a no-op for non-Docker dev environments")
+            return False
+
+        ref = shlex.quote(f"origin/{info.branch_name}")
+        cmd = [
+            "docker",
+            "exec",
+            info.container_name,
+            "sh",
+            "-c",
+            f"git fetch origin && git reset --hard {ref}",
+        ]
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(cmd, capture_output=True, text=True),
+        )
+        if result.returncode != 0:
+            logger.warning("Dev env refresh failed for %s: %s", key, result.stderr[:400])
+            return False
+
+        logger.info("Dev env refreshed for %s (branch %s)", key, info.branch_name)
         return True
 
     def get_info(self, ticket_id: str, provider: str) -> Optional[DevEnvironmentInfo]:
@@ -513,12 +645,20 @@ class DevEnvironmentManager:
         port: int,
         container_name: str,
         url: str,
+        repo_path: str,
         project_stack: "Optional[Any]" = None,
     ) -> DevEnvironmentInfo:
         """Launch a Docker container for the ticket branch.
 
         Parameters
         ----------
+        repo_path : str
+            Repo path as Marcus's own process sees it (used for stack
+            auto-detection). Translated to a HOST path via
+            :func:`_resolve_host_repo_path` for the ``docker run -v``
+            mount source, since ``docker run`` is executed against the
+            HOST's Docker daemon (Docker-outside-of-Docker), not a path
+            inside Marcus's own container.
         project_stack : Optional[ProjectStack]
             Tech-stack parsed from the project description.  When supplied
             this takes priority over file-based detection.
@@ -538,7 +678,7 @@ class DevEnvironmentManager:
             )
         elif self.config.auto_detect:
             # Fallback: sniff repo root for well-known files
-            stack_key = detect_project_type(self.config.repo_path)
+            stack_key = detect_project_type(repo_path)
             fb = _FALLBACK_STACKS[stack_key]
             install_cmd = fb["install"]
             start_cmd = fb["start"]
@@ -573,7 +713,7 @@ class DevEnvironmentManager:
                 "-p",
                 f"{port}:3000",
                 "-v",
-                f"{self.config.repo_path}:/app",
+                f"{_resolve_host_repo_path(repo_path)}:/app",
                 "-w",
                 "/app",
             ]
@@ -627,6 +767,7 @@ class DevEnvironmentManager:
         port: int,
         container_name: str,
         url: str,
+        repo_path: str,
     ) -> DevEnvironmentInfo:
         """Start a local dev process for the ticket branch."""
         cmd_str = self.config.dev_command.format(port=port)
@@ -640,7 +781,7 @@ class DevEnvironmentManager:
                 lambda: subprocess.Popen(
                     cmd_str,
                     shell=True,  # nosec B602
-                    cwd=self.config.repo_path,
+                    cwd=repo_path,
                     env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,

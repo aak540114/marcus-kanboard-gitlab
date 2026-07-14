@@ -3,11 +3,13 @@ Unit tests for src/core/dev_environment.py
 """
 
 import socket
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from src.core.dev_env_settings import DevEnvSettingsManager
 from src.core.dev_environment import (
     DevEnvironmentConfig,
     DevEnvironmentManager,
@@ -370,3 +372,259 @@ class TestBuildEntrypoint:
                     use_hm_reload=False,
                 )
                 assert "inotifywait" in cmd, f"{stack!r} should use inotifywait"
+
+
+# ---------------------------------------------------------------------------
+# Per-call repo_path override + Docker-outside-of-Docker host path
+# translation (docker run -v <host_path>:/app must be a HOST path when
+# Marcus itself runs inside a container talking to the host's Docker
+# daemon over a mounted docker.sock).
+# ---------------------------------------------------------------------------
+
+
+class TestStartDockerRepoPath:
+    """start() docker path: per-call repo_path override + host path translation."""
+
+    @pytest.fixture
+    def docker_config(self, tmp_path):
+        return DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=True,
+            auto_detect=False,
+            dev_command="npm run dev -- --port {port}",
+            port_range=(19700, 19750),
+        )
+
+    @pytest.fixture
+    def docker_manager(self, docker_config, tmp_path):
+        return DevEnvironmentManager(
+            config=docker_config,
+            settings_manager=DevEnvSettingsManager(data_dir=tmp_path),
+        )
+
+    @pytest.mark.asyncio
+    async def test_uses_per_call_repo_path_override(self, docker_manager, tmp_path):
+        """An explicit repo_path passed to start() overrides self.config.repo_path."""
+        override_path = str(tmp_path / "other-repo")
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await docker_manager.start(
+                "T-10", "kanboard", "ticket/kanboard/t-10", repo_path=override_path
+            )
+        cmd = mock_run.call_args[0][0]
+        assert f"{override_path}:/app" in cmd
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_config_repo_path(self, docker_manager, tmp_path):
+        """No repo_path override → self.config.repo_path is used, as before."""
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await docker_manager.start("T-11", "kanboard", "ticket/kanboard/t-11")
+        cmd = mock_run.call_args[0][0]
+        assert f"{tmp_path!s}:/app" in cmd
+
+    @pytest.mark.asyncio
+    async def test_translates_to_host_path_when_dood_configured(
+        self, docker_manager, monkeypatch
+    ):
+        """MARCUS_HOST_PROJECT_ROOT set → /app/... repo_path becomes a host path."""
+        monkeypatch.setenv("MARCUS_HOST_PROJECT_ROOT", "/home/user/marcus")
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await docker_manager.start(
+                "T-12",
+                "kanboard",
+                "ticket/kanboard/t-12",
+                repo_path="/app/data/repos/x",
+            )
+        cmd = mock_run.call_args[0][0]
+        assert "/home/user/marcus/data/repos/x:/app" in cmd
+        assert "/app/data/repos/x:/app" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_translates_relative_repo_path_when_dood_configured(
+        self, docker_manager, monkeypatch
+    ):
+        """A ./data/... relative repo_path is also translated."""
+        monkeypatch.setenv("MARCUS_HOST_PROJECT_ROOT", "/srv/marcus")
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await docker_manager.start(
+                "T-13",
+                "kanboard",
+                "ticket/kanboard/t-13",
+                repo_path="./data/repos/y",
+            )
+        cmd = mock_run.call_args[0][0]
+        assert "/srv/marcus/data/repos/y:/app" in cmd
+
+    @pytest.mark.asyncio
+    async def test_no_translation_when_host_root_unset(
+        self, docker_manager, monkeypatch
+    ):
+        """MARCUS_HOST_PROJECT_ROOT unset (e.g. local/non-Docker) → path used as-is."""
+        monkeypatch.delenv("MARCUS_HOST_PROJECT_ROOT", raising=False)
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await docker_manager.start(
+                "T-14",
+                "kanboard",
+                "ticket/kanboard/t-14",
+                repo_path="/app/data/repos/z",
+            )
+        cmd = mock_run.call_args[0][0]
+        assert "/app/data/repos/z:/app" in cmd
+
+
+# ---------------------------------------------------------------------------
+# max_parallel_containers enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestMaxParallelContainers:
+    """DevEnvironmentManager.start() honours DevEnvSettingsManager's limit."""
+
+    @pytest.fixture
+    def limited_manager(self, tmp_path):
+        settings = DevEnvSettingsManager(data_dir=tmp_path)
+        settings.set_max_parallel_containers(1)
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=False,
+            dev_command="echo dev-server --port {port}",
+            port_range=(19750, 19800),
+        )
+        return DevEnvironmentManager(config=config, settings_manager=settings)
+
+    @pytest.mark.asyncio
+    async def test_raises_when_limit_reached_for_new_ticket(self, limited_manager):
+        """A second, different ticket is refused once the limit is hit."""
+        mock_popen = MagicMock(spec=subprocess.Popen)
+        mock_popen.poll.return_value = None
+        with patch("subprocess.Popen", return_value=mock_popen):
+            await limited_manager.start("T-20", "kanboard", "b1")
+            with pytest.raises(RuntimeError, match="[Mm]ax parallel"):
+                await limited_manager.start("T-21", "kanboard", "b2")
+
+    @pytest.mark.asyncio
+    async def test_existing_ticket_not_blocked_by_its_own_env(self, limited_manager):
+        """Re-requesting the SAME ticket's already-running env doesn't count as new."""
+        mock_popen = MagicMock(spec=subprocess.Popen)
+        mock_popen.poll.return_value = None
+        with patch("subprocess.Popen", return_value=mock_popen):
+            info1 = await limited_manager.start("T-22", "kanboard", "b1")
+            info2 = await limited_manager.start("T-22", "kanboard", "b1")
+        assert info1.port == info2.port
+
+    @pytest.mark.asyncio
+    async def test_stopping_frees_a_slot(self, limited_manager):
+        """Stopping the running env allows a new ticket's env to start."""
+        mock_popen = MagicMock(spec=subprocess.Popen)
+        mock_popen.poll.return_value = None
+        with patch("subprocess.Popen", return_value=mock_popen):
+            await limited_manager.start("T-23", "kanboard", "b1")
+            await limited_manager.stop("T-23", "kanboard")
+            info = await limited_manager.start("T-24", "kanboard", "b2")
+        assert info.ticket_id == "T-24"
+
+    @pytest.mark.asyncio
+    async def test_no_limit_when_unset(self, tmp_path):
+        """No configured limit (None) → unlimited, matching pre-existing behaviour."""
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=False,
+            dev_command="echo dev-server --port {port}",
+            port_range=(19800, 19850),
+        )
+        mgr = DevEnvironmentManager(
+            config=config, settings_manager=DevEnvSettingsManager(data_dir=tmp_path)
+        )
+        mock_popen = MagicMock(spec=subprocess.Popen)
+        mock_popen.poll.return_value = None
+        with patch("subprocess.Popen", return_value=mock_popen):
+            await mgr.start("T-25", "kanboard", "b1")
+            await mgr.start("T-26", "kanboard", "b2")
+        assert len(mgr.list_running()) == 2
+
+
+# ---------------------------------------------------------------------------
+# refresh() — instant webhook-driven reload trigger
+# ---------------------------------------------------------------------------
+
+
+class TestRefresh:
+    """refresh() pulls the latest branch commit into a running container."""
+
+    @pytest.fixture
+    def docker_manager(self, tmp_path):
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=True,
+            auto_detect=False,
+            dev_command="npm run dev -- --port {port}",
+            port_range=(19850, 19900),
+        )
+        return DevEnvironmentManager(
+            config=config, settings_manager=DevEnvSettingsManager(data_dir=tmp_path)
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_not_running(self, docker_manager):
+        """No environment running for the ticket → False, no docker call."""
+        with patch("subprocess.run") as mock_run:
+            result = await docker_manager.refresh("T-30", "kanboard")
+        assert result is False
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runs_git_fetch_reset_via_docker_exec(self, docker_manager):
+        """refresh() execs git fetch + hard reset to the branch inside the container."""
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")):
+            info = await docker_manager.start("T-31", "kanboard", "feature/x")
+
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            ok = await docker_manager.refresh("T-31", "kanboard")
+
+        assert ok is True
+        cmd = mock_run.call_args[0][0]
+        assert cmd[:3] == ["docker", "exec", info.container_name]
+        assert "git fetch origin" in cmd[-1]
+        assert "origin/feature/x" in cmd[-1]
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_git_failure(self, docker_manager):
+        """A non-zero exit from the docker exec command → False, not raised."""
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")):
+            await docker_manager.start("T-32", "kanboard", "feature/y")
+
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(returncode=1, stderr="fatal: not a repo"),
+        ):
+            ok = await docker_manager.refresh("T-32", "kanboard")
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_returns_false_for_local_non_docker_env(self, tmp_path):
+        """use_docker=False environments have no container to exec into."""
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=False,
+            dev_command="echo dev --port {port}",
+            port_range=(19900, 19950),
+        )
+        mgr = DevEnvironmentManager(
+            config=config, settings_manager=DevEnvSettingsManager(data_dir=tmp_path)
+        )
+        mock_popen = MagicMock(spec=subprocess.Popen)
+        mock_popen.poll.return_value = None
+        with patch("subprocess.Popen", return_value=mock_popen):
+            await mgr.start("T-33", "kanboard", "b1")
+        assert await mgr.refresh("T-33", "kanboard") is False
