@@ -693,6 +693,123 @@ class TestGetWorkContextEnsuresRepo:
 
 
 # ---------------------------------------------------------------------------
+# start_dev_environment: resolves the ticket's real per-project repo path,
+# same as get_work_context — this is the AI-agent-facing MCP tool path,
+# separate from (and previously missed by) the HTTP /dev-env/view button.
+# ---------------------------------------------------------------------------
+
+
+class TestStartDevEnvironmentResolvesRepoPath:
+    @pytest.fixture
+    def mock_project_sync(self):
+        ps = MagicMock()
+        ps.get_repo_for_project = MagicMock(return_value=None)
+        ps.ensure_repo = AsyncMock(
+            return_value={
+                "local_repo_path": "./data/repos/shopping-cart",
+                "gitea_repo_url": "http://localhost:3000/root/shopping-cart.git",
+            }
+        )
+        return ps
+
+    @pytest.fixture
+    def workflow_with_sync(
+        self, lifecycle, mock_kanban, mock_branch, mock_dev_env, mock_ac_gen,
+        mock_project_sync,
+    ):
+        events = Events()
+        wf = HumanGatedWorkflow(
+            kanban=mock_kanban,
+            events=events,
+            provider_name="kanboard",
+            lifecycle=lifecycle,
+            branch_manager=mock_branch,
+            dev_env_manager=mock_dev_env,
+            ac_generator=mock_ac_gen,
+            project_sync=mock_project_sync,
+        )
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            yield wf
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_ticket_untracked(self, workflow):
+        assert await workflow.start_dev_environment("999") is None
+
+    @pytest.mark.asyncio
+    async def test_passes_resolved_repo_path_to_dev_env_start(
+        self, workflow_with_sync, lifecycle, mock_kanban, mock_dev_env, mock_project_sync
+    ):
+        lifecycle.get_or_create("80", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        mock_kanban.get_project_name = AsyncMock(return_value="Shopping Cart")
+
+        await workflow_with_sync.start_dev_environment("80")
+
+        mock_project_sync.ensure_repo.assert_awaited_once()
+        call_kwargs = mock_dev_env.start.call_args.kwargs
+        assert call_kwargs["repo_path"] == "./data/repos/shopping-cart"
+        assert call_kwargs["ticket_id"] == "80"
+
+    @pytest.mark.asyncio
+    async def test_no_project_sync_passes_none_repo_path(
+        self, workflow, lifecycle, mock_kanban, mock_dev_env
+    ):
+        """workflow fixture has no project_sync — repo_path stays None,
+        matching the pre-existing behaviour (DevEnvironmentManager falls
+        back to its own configured default)."""
+        lifecycle.get_or_create("81", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+
+        await workflow.start_dev_environment("81")
+
+        call_kwargs = mock_dev_env.start.call_args.kwargs
+        assert call_kwargs["repo_path"] is None
+
+    @pytest.mark.asyncio
+    async def test_kanban_task_lookup_failure_does_not_crash(
+        self, workflow_with_sync, lifecycle, mock_kanban, mock_dev_env
+    ):
+        lifecycle.get_or_create("82", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(side_effect=RuntimeError("kanban down"))
+
+        url = await workflow_with_sync.start_dev_environment("82")
+
+        assert url is not None  # dev env still starts, just without repo_path
+        call_kwargs = mock_dev_env.start.call_args.kwargs
+        assert call_kwargs["repo_path"] is None
+
+    @pytest.mark.asyncio
+    async def test_dev_env_start_failure_returns_none(
+        self, workflow, lifecycle, mock_kanban, mock_dev_env
+    ):
+        lifecycle.get_or_create("83", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        mock_dev_env.start = AsyncMock(side_effect=RuntimeError("docker unreachable"))
+
+        assert await workflow.start_dev_environment("83") is None
+
+    @pytest.mark.asyncio
+    async def test_posts_comment_and_returns_url_on_success(
+        self, workflow, lifecycle, mock_kanban, mock_dev_env
+    ):
+        from types import SimpleNamespace
+
+        lifecycle.get_or_create("84", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        mock_dev_env.start = AsyncMock(
+            return_value=SimpleNamespace(port=9100, url="http://localhost:9100")
+        )
+
+        url = await workflow.start_dev_environment("84")
+
+        assert url == "http://localhost:9100"
+        mock_kanban.add_comment.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # get_project_description
 # ---------------------------------------------------------------------------
 

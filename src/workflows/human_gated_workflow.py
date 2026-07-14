@@ -50,7 +50,7 @@ HumanGatedWorkflow
 
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from src.ai.verification.ai_verifier import AIVerifier, VerificationResult
 from src.core.acceptance_criteria import ACChangeDetector, ACGenerator, ACParser
@@ -823,6 +823,51 @@ class HumanGatedWorkflow:
 
         return True
 
+    async def _resolve_project_repo_mapping(
+        self, kanboard_project_id: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve (provisioning on-demand if needed) a project's repo mapping.
+
+        Shared by :meth:`get_work_context` and :meth:`start_dev_environment`
+        — both need the ticket's project repo, and nothing in Marcus
+        currently publishes a ``project.created`` event, so this on-demand
+        lookup is the only path that actually creates the Gitea repo + push
+        webhook (see ``ProjectSyncWorkflow.ensure_repo``'s docstring).
+        Subsequent calls just hit the cached mapping.
+
+        Parameters
+        ----------
+        kanboard_project_id : Optional[int]
+            The ticket's resolved Kanboard project id, or ``None`` if
+            unknown (nothing to resolve against).
+
+        Returns
+        -------
+        Optional[Dict[str, Any]]
+            Dict with ``local_repo_path``/``gitea_repo_url``, or ``None``
+            if unresolvable.
+        """
+        if not self._project_sync or kanboard_project_id is None:
+            return None
+        mapping = self._project_sync.get_repo_for_project(kanboard_project_id)
+        if mapping is None:
+            get_project_name = getattr(self._kanban, "get_project_name", None)
+            if get_project_name is not None:
+                try:
+                    project_name = await get_project_name(kanboard_project_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Could not fetch project name for %d: %s",
+                        kanboard_project_id,
+                        exc,
+                    )
+                    project_name = None
+                if project_name:
+                    mapping = await self._project_sync.ensure_repo(
+                        kanboard_project_id, project_name
+                    )
+        return cast(Optional[Dict[str, Any]], mapping)
+
     async def start_dev_environment(self, ticket_id: str) -> Optional[str]:
         """Spin up the hot-reload dev environment for a ticket branch.
 
@@ -840,11 +885,27 @@ class HumanGatedWorkflow:
         if record is None:
             return None
 
+        kanboard_project_id: Optional[int] = None
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task:
+                src_ctx = task.source_context or {}
+                raw = src_ctx.get("kanboard_task", {})
+                project_id_raw = raw.get("project_id")
+                if project_id_raw:
+                    kanboard_project_id = int(project_id_raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch task %s from kanban: %s", ticket_id, exc)
+
+        mapping = await self._resolve_project_repo_mapping(kanboard_project_id)
+        repo_path = mapping.get("local_repo_path") if mapping else None
+
         try:
             info = await self._dev_env.start(
                 ticket_id=ticket_id,
                 provider=self._provider,
                 branch_name=record.branch_name,
+                repo_path=repo_path,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to start dev env for %s: %s", ticket_id, exc)
@@ -951,30 +1012,13 @@ class HumanGatedWorkflow:
         # nothing in Marcus currently publishes a `project.created` event
         # (see ProjectSyncWorkflow.ensure_repo's docstring), so this is the
         # only path that actually creates the Gitea repo + push webhook.
-        # Subsequent calls just hit the cached mapping below.
+        # Subsequent calls just hit the cached mapping.
         local_repo_path: Optional[str] = None
         gitea_repo_url: Optional[str] = None
-        if self._project_sync and kanboard_project_id is not None:
-            mapping = self._project_sync.get_repo_for_project(kanboard_project_id)
-            if mapping is None:
-                get_project_name = getattr(self._kanban, "get_project_name", None)
-                if get_project_name is not None:
-                    try:
-                        project_name = await get_project_name(kanboard_project_id)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Could not fetch project name for %d: %s",
-                            kanboard_project_id,
-                            exc,
-                        )
-                        project_name = None
-                    if project_name:
-                        mapping = await self._project_sync.ensure_repo(
-                            kanboard_project_id, project_name
-                        )
-            if mapping:
-                local_repo_path = mapping.get("local_repo_path")
-                gitea_repo_url = mapping.get("gitea_repo_url")
+        mapping = await self._resolve_project_repo_mapping(kanboard_project_id)
+        if mapping:
+            local_repo_path = mapping.get("local_repo_path")
+            gitea_repo_url = mapping.get("gitea_repo_url")
 
         return {
             "ticket_id": ticket_id,
