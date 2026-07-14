@@ -3132,6 +3132,34 @@ async def main() -> None:
         raise
 
 
+def _get_dev_env_settings_mgr(server: "MarcusServer") -> Any:
+    """Return the shared DevEnvSettingsManager singleton, constructing it once.
+
+    Must be shared across every ``DevEnvironmentManager`` instance AND the
+    ``/api/dev-env-setting`` route: ``DevEnvSettingsManager`` caches its
+    value in memory after the first disk read, so two separate instances
+    would silently diverge — a human's UI change to the limit would never
+    reach the running ``DevEnvironmentManager`` that actually enforces it.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+
+    Returns
+    -------
+    DevEnvSettingsManager
+        The shared settings manager.
+    """
+    from src.core.dev_env_settings import DevEnvSettingsManager
+
+    mgr = getattr(server, "_dev_env_settings_mgr", None)
+    if mgr is None:
+        mgr = DevEnvSettingsManager()
+        server._dev_env_settings_mgr = mgr  # type: ignore[attr-defined]
+    return mgr
+
+
 async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
     """Construct and start the human-gated ticket workflow subsystem.
 
@@ -3213,7 +3241,9 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
 
     dev_env_mgr = getattr(server, "_dev_env_manager", None)
     if dev_env_mgr is None:
-        dev_env_mgr = DevEnvironmentManager()
+        dev_env_mgr = DevEnvironmentManager(
+            settings_manager=_get_dev_env_settings_mgr(server)
+        )
         server._dev_env_manager = dev_env_mgr  # type: ignore[attr-defined]
 
     workflow = HumanGatedWorkflow(
@@ -3445,7 +3475,9 @@ if __name__ == "__main__":
 
                 dev_mgr = getattr(server, "_dev_env_manager", None)
                 if dev_mgr is None:
-                    dev_mgr = DevEnvironmentManager()
+                    dev_mgr = DevEnvironmentManager(
+                        settings_manager=_get_dev_env_settings_mgr(server)
+                    )
                     server._dev_env_manager = dev_mgr  # type: ignore[attr-defined]
 
                 # ── Resolve tech stack from project description ──────────
@@ -3749,6 +3781,55 @@ function save() {{
             r.headers["Access-Control-Allow-Origin"] = "*"
             return r
 
+        async def dev_env_setting_api(request: Request) -> JSONResponse:
+            """GET/PUT the global max-parallel-dev-environments limit.
+
+            Unlike gate settings, this is a single global value — dev-
+            environment containers are a host-wide resource constraint,
+            not something scoped per project or ticket (see
+            src/core/dev_env_settings.py).
+
+            GET  /api/dev-env-setting
+                Returns: {"max_parallel_containers": int | null}
+                (null = unlimited, the default until a human sets a limit)
+
+            PUT  /api/dev-env-setting
+                Body (JSON): {"max_parallel_containers": <non-negative int>}
+            """
+            settings_mgr = _get_dev_env_settings_mgr(server)
+
+            if request.method == "PUT":
+                try:
+                    body = await request.json()
+                except Exception:
+                    r = JSONResponse({"error": "invalid JSON"}, status_code=400)
+                    r.headers["Access-Control-Allow-Origin"] = "*"
+                    return r
+
+                count = body.get("max_parallel_containers")
+                if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                    r = JSONResponse(
+                        {
+                            "error": "max_parallel_containers (non-negative int) required"
+                        },
+                        status_code=400,
+                    )
+                    r.headers["Access-Control-Allow-Origin"] = "*"
+                    return r
+
+                settings_mgr.set_max_parallel_containers(count)
+                r = JSONResponse(
+                    {"saved": True, "max_parallel_containers": count}
+                )
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                return r
+
+            r = JSONResponse(
+                {"max_parallel_containers": settings_mgr.get_max_parallel_containers()}
+            )
+            r.headers["Access-Control-Allow-Origin"] = "*"
+            return r
+
         async def dev_env_stop(request: Request) -> JSONResponse:
             """Stop a running dev environment and tear down its Docker container.
 
@@ -4011,6 +4092,7 @@ function save() {{
                 Route("/api/gate-setting", gate_setting_api, methods=["GET"]),
                 Route("/api/gate-setting/project", gate_setting_api, methods=["PUT"]),
                 Route("/api/gate-setting/ticket", gate_setting_api, methods=["PUT"]),
+                Route("/api/dev-env-setting", dev_env_setting_api, methods=["GET", "PUT"]),
                 Mount("/", app=mcp_app),
             ],
             lifespan=_lifespan,

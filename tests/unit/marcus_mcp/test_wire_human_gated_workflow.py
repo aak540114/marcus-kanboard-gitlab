@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.marcus_mcp.server import _wire_human_gated_workflow
+from src.marcus_mcp.server import _get_dev_env_settings_mgr, _wire_human_gated_workflow
 
 
 def _make_server(events=MagicMock(), kanban_client=MagicMock(), provider="kanboard"):
@@ -180,3 +180,36 @@ class TestSharesDevEnvManagerSingleton:
 
         dev_env_cls.assert_not_called()
         assert wf_cls.call_args.kwargs["dev_env_manager"] is existing_dev_mgr
+
+
+class TestGetDevEnvSettingsMgr:
+    """_get_dev_env_settings_mgr must return one shared instance per server.
+
+    DevEnvSettingsManager caches its value in memory after the first disk
+    read — a second, independently-constructed instance would silently
+    diverge from a human's live change via /api/dev-env-setting, so every
+    caller (both DevEnvironmentManager construction sites and the API
+    route) must resolve to the exact same object.
+    """
+
+    def test_constructs_once_and_caches_on_server(self):
+        server = SimpleNamespace()
+        with patch("src.core.dev_env_settings.DevEnvSettingsManager") as mgr_cls:
+            mgr_cls.return_value = MagicMock()
+            first = _get_dev_env_settings_mgr(server)
+            second = _get_dev_env_settings_mgr(server)
+
+        mgr_cls.assert_called_once()
+        assert first is second
+        assert server._dev_env_settings_mgr is first
+
+    def test_reuses_a_preexisting_instance(self):
+        server = SimpleNamespace()
+        existing = MagicMock()
+        server._dev_env_settings_mgr = existing
+
+        with patch("src.core.dev_env_settings.DevEnvSettingsManager") as mgr_cls:
+            result = _get_dev_env_settings_mgr(server)
+
+        mgr_cls.assert_not_called()
+        assert result is existing
