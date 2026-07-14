@@ -527,6 +527,13 @@ class MarcusServer:
             if self.lease_monitor:
                 await self.lease_monitor.stop()
 
+            # Stop the human-gated workflow: releases the BoardWatcher poll
+            # loop and tears down any running dev-environment containers
+            # (see HumanGatedWorkflow.stop() -> DevEnvironmentManager.stop_all()).
+            human_gated_workflow = getattr(self, "_human_gated_workflow", None)
+            if human_gated_workflow is not None:
+                await human_gated_workflow.stop()
+
             # Close realtime log
             if hasattr(self, "realtime_log") and self.realtime_log:
                 self.realtime_log.close()
@@ -3125,6 +3132,105 @@ async def main() -> None:
         raise
 
 
+async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
+    """Construct and start the human-gated ticket workflow subsystem.
+
+    Wires ``GiteaManager`` -> ``ProjectSyncWorkflow`` -> ``HumanGatedWorkflow``
+    onto the server's already-initialized ``Events``/kanban client, and
+    registers the workflow via ``register_workflow`` so the MCP tools in
+    ``src/marcus_mcp/tools/human_gated.py`` (``get_work_context``,
+    ``signal_ready_for_review``, ``start_ticket_dev_environment``, etc.)
+    become functional instead of returning
+    ``"HumanGatedWorkflow not initialised"`` on every call — which is what
+    happens today, since nothing in the codebase ever constructs
+    ``HumanGatedWorkflow``.
+
+    Degrades gracefully rather than blocking server startup: if
+    ``Events``/kanban aren't configured the whole subsystem is skipped
+    (logged, not raised); if Gitea specifically isn't reachable, the
+    ticket workflow still starts, just without repo/webhook sync.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The server instance, after ``await server.initialize()`` has run.
+    """
+    if server.events is None or server.kanban_client is None:
+        logger.warning(
+            "HumanGatedWorkflow not started: Events and/or kanban_client "
+            "are not initialized (enable 'features.events' and configure "
+            "a kanban provider)."
+        )
+        return
+
+    from src.core.dev_environment import DevEnvironmentManager
+    from src.integrations.gitea_manager import GiteaManager
+    from src.marcus_mcp.tools.human_gated import register_workflow
+    from src.workflows.human_gated_workflow import HumanGatedWorkflow
+    from src.workflows.project_sync_workflow import ProjectSyncWorkflow
+
+    project_sync = None
+    gitea_url = os.environ.get("GITEA_URL")
+    gitea_token = os.environ.get("GITEA_TOKEN")
+    if gitea_url and gitea_token:
+        gitea_mgr = GiteaManager(
+            gitea_url=gitea_url,
+            token=gitea_token,
+            namespace=os.environ.get("GITEA_NAMESPACE") or None,
+        )
+        if await gitea_mgr.connect():
+            # Both must be set for auto webhook creation — an unset secret
+            # would sign deliveries with nothing, which is worse than not
+            # registering a webhook at all.
+            webhook_secret = os.environ.get("GITEA_WEBHOOK_TOKEN") or None
+            webhook_target = (
+                os.environ.get(
+                    "GITEA_WEBHOOK_TARGET_URL", "http://marcus:4298/webhooks/gitea"
+                )
+                if webhook_secret
+                else None
+            )
+            project_sync = ProjectSyncWorkflow(
+                gitea_manager=gitea_mgr,
+                events=server.events,
+                repos_path="./data/project_repos.json",
+                local_repos_base="./data/repos",
+                webhook_target_url=webhook_target,
+                webhook_secret=webhook_secret,
+            )
+            project_sync.subscribe()
+            server._gitea_manager = gitea_mgr  # type: ignore[attr-defined]
+        else:
+            logger.warning(
+                "GiteaManager could not connect to %s — dev-environment "
+                "repo sync disabled",
+                gitea_url,
+            )
+    else:
+        logger.info(
+            "GITEA_URL/GITEA_TOKEN not set — dev-environment repo sync disabled"
+        )
+
+    dev_env_mgr = getattr(server, "_dev_env_manager", None)
+    if dev_env_mgr is None:
+        dev_env_mgr = DevEnvironmentManager()
+        server._dev_env_manager = dev_env_mgr  # type: ignore[attr-defined]
+
+    workflow = HumanGatedWorkflow(
+        kanban=server.kanban_client,
+        events=server.events,
+        provider_name=server.provider,
+        project_sync=project_sync,
+        dev_env_manager=dev_env_mgr,
+    )
+    register_workflow(workflow)
+    await workflow.start()
+
+    server._project_sync = project_sync  # type: ignore[attr-defined]
+    server._human_gated_workflow = workflow  # type: ignore[attr-defined]
+    logger.info("HumanGatedWorkflow started for provider=%s", server.provider)
+
+
 def cli_main() -> None:
     """Run the ``marcus`` command — synchronous console-script entry point.
 
@@ -3188,6 +3294,8 @@ if __name__ == "__main__":
                 provider=server.provider,
             )
 
+            await _wire_human_gated_workflow(server)
+
             return server
 
         # Run the async setup
@@ -3225,8 +3333,19 @@ if __name__ == "__main__":
             if hasattr(server, "_shutdown_event"):
                 server._shutdown_event.set()
 
-            # Perform sync cleanup
-            if hasattr(server, "_sync_cleanup"):
+            # Prefer the async cleanup path (stops the human-gated workflow's
+            # dev-environment containers cleanly) whenever uvicorn's event
+            # loop is still running — same pattern as the stdio-mode
+            # signal_handler above. Falls back to the sync, force-exit path
+            # only if there's no loop to schedule a task on.
+            try:
+                loop_running = asyncio.get_event_loop().is_running()
+            except RuntimeError:
+                loop_running = False
+
+            if loop_running and hasattr(server, "_cleanup_on_shutdown"):
+                asyncio.create_task(server._cleanup_on_shutdown())
+            elif hasattr(server, "_sync_cleanup"):
                 server._sync_cleanup()
 
         # Register signal handlers
