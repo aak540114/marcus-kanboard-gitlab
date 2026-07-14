@@ -107,6 +107,15 @@ fi
 if [ -z "$(env_get KANBOARD_WEBHOOK_TOKEN)" ]; then
     env_set KANBOARD_WEBHOOK_TOKEN "$(openssl rand -hex 32)"
 fi
+if [ -z "$(env_get GITEA_WEBHOOK_TOKEN)" ]; then
+    # Shared HMAC secret for the dev-environment instant-refresh webhook
+    # (src/core/gitea_webhook_receiver.py). No Gitea UI step needed to use
+    # it: ProjectSyncWorkflow.ensure_repo() calls GiteaManager.create_webhook()
+    # automatically the first time each project's repo is provisioned,
+    # using this same value (passed through docker-compose.yml's
+    # GITEA_WEBHOOK_TOKEN env var) to sign deliveries.
+    env_set GITEA_WEBHOOK_TOKEN "$(openssl rand -hex 32)"
+fi
 if [ -z "$(env_get KANBOARD_PROJECT_NAME)" ]; then
     env_set KANBOARD_PROJECT_NAME "Marcus Project"
 fi
