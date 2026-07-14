@@ -700,6 +700,50 @@ class TestAssignTask:
 # ---------------------------------------------------------------------------
 
 
+class TestGetProjectName:
+    """Test get_project_name()."""
+
+    @pytest.mark.asyncio
+    async def test_returns_name_for_configured_project_from_cache(self, kanban):
+        """The configured project's name is served from the connect()-time
+        cache without an extra RPC call."""
+        kanban._client = AsyncMock()
+        kanban._project_name = "Marcus Project"
+        # _project_id defaults to 1 per the `config` fixture
+        result = await kanban.get_project_name(1)
+        assert result == "Marcus Project"
+
+    @pytest.mark.asyncio
+    async def test_looks_up_a_different_project_via_rpc(self, kanban):
+        """A project id other than the configured one is fetched live."""
+        kanban._client = AsyncMock()
+        kanban._project_name = "Marcus Project"
+        kanban._client.post = AsyncMock(
+            return_value=_rpc_response({"id": 7, "name": "Other Project"})
+        )
+        result = await kanban.get_project_name(7)
+        assert result == "Other Project"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_project_not_found(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(None))
+        result = await kanban.get_project_name(999)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_rpc_failure(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(side_effect=RuntimeError("API error"))
+        result = await kanban.get_project_name(7)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.get_project_name(1)
+
+
 class TestGetProjectMetrics:
     """Test get_project_metrics()."""
 

@@ -187,6 +187,68 @@ class GiteaManager:
         logger.info("Created Gitea repo %s", clone_url)
         return clone_url
 
+    async def create_webhook(self, slug: str, target_url: str, secret: str) -> bool:
+        """Create a push webhook on a repo, idempotently.
+
+        Used to get instant "branch was updated" notifications (for the
+        hot-reload dev environment refresh) instead of polling. Gitea signs
+        each delivery with an HMAC-SHA256 of the raw body using ``secret``,
+        sent as the ``X-Gitea-Signature`` header — the receiving endpoint
+        must verify it with the same secret.
+
+        Parameters
+        ----------
+        slug : str
+            URL-safe repository name (e.g. ``shopping-cart``).
+        target_url : str
+            URL Gitea should POST push events to.
+        secret : str
+            Shared HMAC secret for signing deliveries.
+
+        Returns
+        -------
+        bool
+            ``True`` if a new webhook was created; ``False`` if one already
+            existed pointing at the same ``target_url`` (no-op, safe to call
+            on every repo-provisioning run).
+
+        Raises
+        ------
+        RuntimeError
+            If not connected.
+        """
+        if self._client is None:
+            raise RuntimeError("GiteaManager not connected — call connect() first")
+        owner = self._namespace
+
+        r = await self._client.get(f"{self._base}/api/v1/repos/{owner}/{slug}/hooks")
+        r.raise_for_status()
+        for hook in r.json():
+            if hook.get("config", {}).get("url") == target_url:
+                logger.info(
+                    "Gitea webhook for %s already points at %s — skipping",
+                    slug,
+                    target_url,
+                )
+                return False
+
+        payload: Dict[str, Any] = {
+            "type": "gitea",
+            "config": {
+                "url": target_url,
+                "content_type": "json",
+                "secret": secret,
+            },
+            "events": ["push"],
+            "active": True,
+        }
+        r = await self._client.post(
+            f"{self._base}/api/v1/repos/{owner}/{slug}/hooks", json=payload
+        )
+        r.raise_for_status()
+        logger.info("Created Gitea push webhook for %s -> %s", slug, target_url)
+        return True
+
     async def init_with_readme(self, clone_url: str, local_path: str) -> None:
         """Initialise a local repo with a README and push to Gitea.
 

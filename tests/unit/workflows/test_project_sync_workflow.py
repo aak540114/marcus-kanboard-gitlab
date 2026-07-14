@@ -105,6 +105,91 @@ class TestOnProjectCreated:
         assert workflow.get_repo_for_project(3) is None
 
 
+class TestEnsureRepo:
+    @pytest.mark.asyncio
+    async def test_creates_repo_and_returns_mapping(self, workflow, gitea_mgr):
+        mapping = await workflow.ensure_repo(1, "Shopping Cart", "desc")
+
+        gitea_mgr.create_repo.assert_called_once_with("Shopping Cart", "desc")
+        assert mapping is not None
+        assert mapping["gitea_repo_url"] == "http://localhost:3000/root/shopping-cart.git"
+
+    @pytest.mark.asyncio
+    async def test_second_call_is_idempotent(self, workflow, gitea_mgr):
+        first = await workflow.ensure_repo(1, "Shopping Cart")
+        gitea_mgr.create_repo.reset_mock()
+
+        second = await workflow.ensure_repo(1, "Shopping Cart")
+
+        gitea_mgr.create_repo.assert_not_called()
+        assert second == first
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_create_repo_failure(self, workflow, gitea_mgr):
+        gitea_mgr.create_repo = AsyncMock(side_effect=RuntimeError("Gitea unreachable"))
+
+        result = await workflow.ensure_repo(2, "Other Project")
+
+        assert result is None
+        assert workflow.get_repo_for_project(2) is None
+
+    @pytest.mark.asyncio
+    async def test_on_project_created_delegates_to_ensure_repo(self, workflow, gitea_mgr):
+        await workflow._on_project_created(_make_event(1, "Shopping Cart", "desc"))
+
+        gitea_mgr.create_repo.assert_called_once_with("Shopping Cart", "desc")
+        assert workflow.get_repo_for_project(1) is not None
+
+
+class TestEnsureWebhook:
+    @pytest.mark.asyncio
+    async def test_no_webhook_call_when_not_configured(self, workflow, gitea_mgr):
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+
+        await workflow.ensure_repo(1, "Shopping Cart")
+
+        gitea_mgr.create_webhook.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_creates_webhook_when_configured(self, tmp_path, gitea_mgr):
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+        events = MagicMock()
+        wf = ProjectSyncWorkflow(
+            gitea_manager=gitea_mgr,
+            events=events,
+            repos_path=str(tmp_path / "project_repos.json"),
+            local_repos_base=str(tmp_path / "repos"),
+            webhook_target_url="http://marcus:8080/webhooks/gitea",
+            webhook_secret="s3cret",
+        )
+
+        await wf.ensure_repo(1, "Shopping Cart")
+
+        gitea_mgr.create_webhook.assert_called_once_with(
+            "shopping-cart", "http://marcus:8080/webhooks/gitea", "s3cret"
+        )
+
+    @pytest.mark.asyncio
+    async def test_webhook_failure_does_not_block_mapping_persistence(
+        self, tmp_path, gitea_mgr
+    ):
+        gitea_mgr.create_webhook = AsyncMock(side_effect=RuntimeError("gitea down"))
+        events = MagicMock()
+        wf = ProjectSyncWorkflow(
+            gitea_manager=gitea_mgr,
+            events=events,
+            repos_path=str(tmp_path / "project_repos.json"),
+            local_repos_base=str(tmp_path / "repos"),
+            webhook_target_url="http://marcus:8080/webhooks/gitea",
+            webhook_secret="s3cret",
+        )
+
+        mapping = await wf.ensure_repo(1, "Shopping Cart")
+
+        assert mapping is not None
+        assert wf.get_repo_for_project(1) is not None
+
+
 class TestGetRepoForProject:
     def test_returns_none_when_unmapped(self, workflow):
         assert workflow.get_repo_for_project(999) is None

@@ -557,6 +557,40 @@ class KanboardKanban(KanbanInterface):
         }
         return metrics
 
+    async def get_project_name(self, project_id: int) -> Optional[str]:
+        """Return a Kanboard project's name by id.
+
+        Unlike ``self._project_name`` (cached in ``connect()`` for only the
+        single configured ``self._project_id``), this looks up *any*
+        project id — needed when a ticket belongs to a different project
+        than the one this instance was configured against (e.g. resolving
+        the project name to create a Gitea repo on demand).
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project ID.
+
+        Returns
+        -------
+        Optional[str]
+            The project's name, or ``None`` if it doesn't exist or the
+            lookup fails.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before get_project_name()")
+        if project_id == self._project_id and self._project_name:
+            return self._project_name
+        try:
+            project = await self._rpc("getProjectById", project_id=project_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("get_project_name failed for project %s: %s", project_id, exc)
+            return None
+        if not project:
+            return None
+        name = project.get("name")
+        return str(name) if name else None
+
     async def report_blocker(
         self,
         task_id: str,

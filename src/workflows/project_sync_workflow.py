@@ -68,12 +68,27 @@ class ProjectSyncWorkflow:
         events: Events,
         repos_path: str = "./data/project_repos.json",
         local_repos_base: str = "./repos",
+        webhook_target_url: Optional[str] = None,
+        webhook_secret: Optional[str] = None,
     ) -> None:
-        """Initialise the workflow."""
+        """Initialise the workflow.
+
+        Parameters
+        ----------
+        webhook_target_url : Optional[str]
+            URL Gitea should POST push events to (Marcus's
+            ``/webhooks/gitea`` endpoint). When set together with
+            ``webhook_secret``, every repo provisioned by ``ensure_repo``
+            automatically gets a push webhook — no manual setup required.
+        webhook_secret : Optional[str]
+            Shared HMAC secret for signing webhook deliveries.
+        """
         self._gitea = gitea_manager
         self._events = events
         self._repos_path = repos_path
         self._local_repos_base = local_repos_base
+        self._webhook_target_url = webhook_target_url
+        self._webhook_secret = webhook_secret
         self._mapping: Dict[str, Dict[str, Any]] = self._load_mapping()
 
     # ------------------------------------------------------------------
@@ -102,41 +117,96 @@ class ProjectSyncWorkflow:
         pid = int(data.get("kanboard_project_id", 0))
         name = data.get("project_name", f"project-{pid}")
         description = data.get("project_description", "")
+        await self.ensure_repo(pid, name, description)
 
-        key = f"kanboard:{pid}"
+    # ------------------------------------------------------------------
+    # On-demand provisioning
+    # ------------------------------------------------------------------
+
+    async def ensure_repo(
+        self, project_id: int, project_name: str, description: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """Return (creating if necessary) the Gitea repo for a project.
+
+        Idempotent — safe to call every time a ticket's project is looked
+        up, not just from the ``project.created`` event handler (which
+        nothing in Marcus currently publishes). If a mapping already
+        exists it is returned as-is without any network calls.
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project ID.
+        project_name : str
+            Human-readable project name (slugified for the Gitea repo).
+        description : str
+            Optional project description, used as the Gitea repo
+            description on first creation.
+
+        Returns
+        -------
+        Optional[Dict[str, Any]]
+            The project's repo mapping, or None if repo creation failed.
+        """
+        key = f"kanboard:{project_id}"
         if key in self._mapping:
-            logger.debug("Project %d already mapped — skipping", pid)
-            return
+            logger.debug("Project %d already mapped — skipping", project_id)
+            return dict(self._mapping[key])
 
-        slug = _slugify(name)
+        slug = _slugify(project_name)
         local_path = os.path.join(self._local_repos_base, slug)
 
         try:
-            clone_url = await self._gitea.create_repo(name, description)
+            clone_url = await self._gitea.create_repo(project_name, description)
             await self._gitea.init_with_readme(clone_url, local_path)
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "Failed to create Gitea repo for project %d (%s): %s",
-                pid,
-                name,
+                project_id,
+                project_name,
                 exc,
             )
-            return
+            return None
+
+        await self._ensure_webhook(slug)
 
         self._mapping[key] = {
-            "kanboard_project_id": pid,
-            "kanboard_project_name": name,
+            "kanboard_project_id": project_id,
+            "kanboard_project_name": project_name,
             "gitea_repo_url": clone_url,
             "local_repo_path": local_path,
         }
         self._save_mapping()
         logger.info(
             "Project %d (%s) → Gitea %s (local: %s)",
-            pid,
-            name,
+            project_id,
+            project_name,
             clone_url,
             local_path,
         )
+        return dict(self._mapping[key])
+
+    async def _ensure_webhook(self, slug: str) -> None:
+        """Create the push webhook for a repo, if configured.
+
+        Failures are logged and swallowed — a missing webhook degrades
+        the dev-environment refresh from instant to never (until the next
+        ``setup.sh`` run recreates it), but must not block repo creation
+        or ticket work.
+
+        Parameters
+        ----------
+        slug : str
+            URL-safe repository name.
+        """
+        if not self._webhook_target_url or not self._webhook_secret:
+            return
+        try:
+            await self._gitea.create_webhook(
+                slug, self._webhook_target_url, self._webhook_secret
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to create Gitea webhook for %s: %s", slug, exc)
 
     # ------------------------------------------------------------------
     # Public query API

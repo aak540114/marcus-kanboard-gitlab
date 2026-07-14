@@ -249,6 +249,72 @@ class TestCreateRepo:
         mgr._client.post.assert_not_called()
 
 
+class TestCreateWebhook:
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self):
+        mgr = GiteaManager("http://localhost:3000", "tok")
+        with pytest.raises(RuntimeError):
+            await mgr.create_webhook("app", "http://marcus:4298/webhooks/gitea", "sekret")
+
+    @pytest.mark.asyncio
+    async def test_creates_webhook_when_none_exists(self):
+        mgr = GiteaManager("http://localhost:3000", "tok", namespace="root")
+        mgr._client = AsyncMock()
+        mgr._client.get = AsyncMock(return_value=_mock_response([]))
+        mgr._client.post = AsyncMock(return_value=_mock_response({"id": 1}))
+
+        created = await mgr.create_webhook(
+            "app", "http://marcus:4298/webhooks/gitea", "sekret"
+        )
+
+        assert created is True
+        post_url = mgr._client.post.call_args.args[0]
+        assert post_url == "http://localhost:3000/api/v1/repos/root/app/hooks"
+        payload = mgr._client.post.call_args.kwargs["json"]
+        assert payload["type"] == "gitea"
+        assert payload["config"]["url"] == "http://marcus:4298/webhooks/gitea"
+        assert payload["config"]["secret"] == "sekret"
+        assert payload["events"] == ["push"]
+        assert payload["active"] is True
+
+    @pytest.mark.asyncio
+    async def test_skips_creation_when_webhook_already_points_at_same_url(self):
+        mgr = GiteaManager("http://localhost:3000", "tok", namespace="root")
+        mgr._client = AsyncMock()
+        mgr._client.get = AsyncMock(
+            return_value=_mock_response(
+                [{"id": 1, "config": {"url": "http://marcus:4298/webhooks/gitea"}}]
+            )
+        )
+        mgr._client.post = AsyncMock()
+
+        created = await mgr.create_webhook(
+            "app", "http://marcus:4298/webhooks/gitea", "sekret"
+        )
+
+        assert created is False
+        mgr._client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_creates_when_existing_hooks_point_elsewhere(self):
+        """A repo with an unrelated webhook must still get the Marcus one."""
+        mgr = GiteaManager("http://localhost:3000", "tok", namespace="root")
+        mgr._client = AsyncMock()
+        mgr._client.get = AsyncMock(
+            return_value=_mock_response(
+                [{"id": 1, "config": {"url": "http://other-ci.example.com/hook"}}]
+            )
+        )
+        mgr._client.post = AsyncMock(return_value=_mock_response({"id": 2}))
+
+        created = await mgr.create_webhook(
+            "app", "http://marcus:4298/webhooks/gitea", "sekret"
+        )
+
+        assert created is True
+        mgr._client.post.assert_called_once()
+
+
 class TestInitWithReadme:
     @pytest.mark.asyncio
     async def test_runs_git_commands_with_authenticated_push_url(self, tmp_path):
