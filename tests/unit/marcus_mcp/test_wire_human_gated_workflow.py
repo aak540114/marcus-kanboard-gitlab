@@ -16,6 +16,7 @@ import pytest
 
 from src.marcus_mcp.server import (
     _get_dev_env_settings_mgr,
+    _read_bounded_body,
     _resolve_ticket_branch,
     _resolve_ticket_repo_path,
     _verify_ticket_belongs_to_project,
@@ -417,3 +418,60 @@ class TestVerifyTicketBelongsToProject:
         kanban.get_task_by_id = AsyncMock(return_value=_make_task_with_project(7))
         server = SimpleNamespace(kanban_client=kanban)
         assert await _verify_ticket_belongs_to_project(server, "42", "7") is True
+
+
+class _FakeRequest:
+    """Minimal Starlette-Request-shaped fake: .headers.get() + async .stream()."""
+
+    def __init__(self, body: bytes, content_length=None, chunk_size: int = 8):
+        self._body = body
+        self._chunk_size = chunk_size
+        self.headers = {} if content_length is None else {"content-length": content_length}
+
+    async def stream(self):
+        for i in range(0, len(self._body), self._chunk_size):
+            yield self._body[i : i + self._chunk_size]
+
+
+class TestReadBoundedBody:
+    """_read_bounded_body caps webhook payload size before signature/token
+    checks run — those routes are exempt from bearer auth, so an
+    unbounded read would let an unauthenticated caller exhaust memory."""
+
+    @pytest.mark.asyncio
+    async def test_returns_full_body_within_limit(self):
+        req = _FakeRequest(b"small payload")
+        result = await _read_bounded_body(req, max_bytes=1024)
+        assert result == b"small payload"
+
+    @pytest.mark.asyncio
+    async def test_content_length_over_limit_rejected_without_streaming(self):
+        req = _FakeRequest(b"x" * 10, content_length="999999999")
+
+        async def _never_stream():
+            raise AssertionError("must not stream once Content-Length exceeds the cap")
+            yield b""  # pragma: no cover
+
+        req.stream = _never_stream
+        result = await _read_bounded_body(req, max_bytes=1024)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_streamed_body_over_limit_rejected(self):
+        """No (or an understated) Content-Length — the streaming cap still
+        catches an oversized body, e.g. chunked transfer encoding."""
+        req = _FakeRequest(b"x" * 2000, chunk_size=100)
+        result = await _read_bounded_body(req, max_bytes=1024)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_content_length_falls_back_to_streaming_cap(self):
+        req = _FakeRequest(b"x" * 2000, content_length="not-a-number", chunk_size=100)
+        result = await _read_bounded_body(req, max_bytes=1024)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_body_exactly_at_limit_is_accepted(self):
+        req = _FakeRequest(b"x" * 1024, chunk_size=128)
+        result = await _read_bounded_body(req, max_bytes=1024)
+        assert result == b"x" * 1024

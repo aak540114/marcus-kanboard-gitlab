@@ -67,6 +67,18 @@ _DEFAULT_IDLE_TIMEOUT = 4 * 3600  # 4 hours
 #: run_in_executor work elsewhere in Marcus) rather than failing fast.
 _DOCKER_CMD_TIMEOUT = 60
 
+#: Marker file the entrypoint script touches immediately after its own
+#: initial `git checkout` succeeds (see `_build_entrypoint`). `refresh()`
+#: polls for this before running its own `git fetch`/`reset --hard`
+#: against the same container — `docker run -d` returns as soon as the
+#: container starts, not once that entrypoint has actually finished
+#: installing `git` (via apt-get) and checking out the branch, so a
+#: webhook-triggered refresh() arriving in that window could otherwise
+#: race the entrypoint's own git operations against the same working tree.
+_READY_MARKER = "/tmp/.marcus-ready"
+_READY_POLL_INTERVAL = 2.0
+_READY_POLL_MAX_ATTEMPTS = 5
+
 # ---------------------------------------------------------------------------
 # Project-type detection
 # ---------------------------------------------------------------------------
@@ -480,20 +492,87 @@ class DevEnvironmentManager:
         -------
         bool
             ``True`` if an environment was running and was stopped.
+            ``False`` if nothing was running, OR if a running environment
+            could not be confirmed stopped (e.g. a `docker stop` timeout)
+            — bookkeeping is deliberately left intact in that case so a
+            retried ``stop()`` (or the next status check) can still find
+            it, rather than silently forgetting about a container that
+            may still be running and freeing its port/slot for reuse,
+            which would collide with the real container's name on the
+            next ``start()`` for the same ticket.
         """
         key = f"{provider}:{ticket_id}"
-        info = self._envs.pop(key, None)
+        info = self._envs.get(key)
         if info is None:
             return False
 
         if self.config.use_docker:
-            await self._stop_docker(info.container_name)
+            stopped = await self._stop_docker(info.container_name)
         else:
             await self._stop_local(info)
+            stopped = True
 
+        if not stopped:
+            logger.warning(
+                "Dev env stop unconfirmed for %s — leaving it tracked as "
+                "running so a retry can be attempted",
+                key,
+            )
+            return False
+
+        del self._envs[key]
         self._allocator.release(info.port)
         logger.info("Dev env stopped for %s", key)
         return True
+
+    async def _wait_until_ready(self, container_name: str) -> bool:
+        """Poll for the entrypoint's post-checkout readiness marker.
+
+        Guards against a race between :meth:`refresh`'s own git commands
+        and the container's initial ``git checkout`` (see
+        :meth:`_build_entrypoint`) — ``docker run -d`` returns as soon as
+        the container starts, not once that entrypoint script has
+        actually finished installing ``git`` and checking out the
+        branch. A webhook-triggered refresh arriving in that window could
+        otherwise run ``git fetch``/``reset --hard`` concurrently with
+        (or before) the entrypoint's own checkout against the same
+        working tree.
+
+        Parameters
+        ----------
+        container_name : str
+            Name of the running container to check.
+
+        Returns
+        -------
+        bool
+            ``True`` once the marker is found. ``False`` if it never
+            appears within the poll budget, or a check itself times out.
+        """
+        check_cmd = [
+            "docker",
+            "exec",
+            container_name,
+            "sh",
+            "-c",
+            f"test -f {_READY_MARKER}",
+        ]
+        loop = asyncio.get_event_loop()
+        for attempt in range(_READY_POLL_MAX_ATTEMPTS):
+            try:
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        check_cmd, capture_output=True, timeout=_DOCKER_CMD_TIMEOUT
+                    ),
+                )
+            except subprocess.TimeoutExpired:
+                return False
+            if result.returncode == 0:
+                return True
+            if attempt < _READY_POLL_MAX_ATTEMPTS - 1:
+                await asyncio.sleep(_READY_POLL_INTERVAL)
+        return False
 
     async def refresh(self, ticket_id: str, provider: str) -> bool:
         """Pull the latest branch commit into a running dev-environment container.
@@ -529,6 +608,14 @@ class DevEnvironmentManager:
 
         if not self.config.use_docker:
             logger.debug("refresh() is a no-op for non-Docker dev environments")
+            return False
+
+        if not await self._wait_until_ready(info.container_name):
+            logger.warning(
+                "Dev env refresh skipped for %s: container not ready yet "
+                "(still installing dependencies / checking out its branch)",
+                key,
+            )
             return False
 
         ref = shlex.quote(f"origin/{info.branch_name}")
@@ -636,7 +723,17 @@ class DevEnvironmentManager:
         # string is eventually passed to inside the container — quote it
         # so shell metacharacters in an unsanitized caller's input can't
         # break out of `git checkout` into arbitrary command execution.
-        steps = [apt_line, f"git checkout {shlex.quote(branch_name)}"]
+        #
+        # The `touch _READY_MARKER` immediately after checkout lets
+        # refresh() (see _wait_until_ready) confirm the initial checkout
+        # has actually happened before running its own git commands
+        # against /app — apt-get above can take tens of seconds, and
+        # `docker run -d` returns long before this script reaches here.
+        steps = [
+            apt_line,
+            f"git checkout {shlex.quote(branch_name)}",
+            f"touch {_READY_MARKER}",
+        ]
         if install_cmd:
             steps.append(install_cmd)
 
@@ -773,8 +870,18 @@ class DevEnvironmentManager:
             container_name=container_name,
         )
 
-    async def _stop_docker(self, container_name: str) -> None:
-        """Stop and remove a Docker container (best-effort)."""
+    async def _stop_docker(self, container_name: str) -> bool:
+        """Stop and remove a Docker container (best-effort).
+
+        Returns
+        -------
+        bool
+            ``True`` if the stop command completed (regardless of exit
+            code — a container that was already gone still means nothing
+            is left running). ``False`` only on timeout, meaning the
+            container's true state is unknown — the caller must NOT
+            assume it's actually stopped.
+        """
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(
@@ -785,6 +892,7 @@ class DevEnvironmentManager:
                     timeout=_DOCKER_CMD_TIMEOUT,
                 ),
             )
+            return True
         except subprocess.TimeoutExpired:
             logger.warning(
                 "docker stop timed out for %s after %ds (Docker daemon "
@@ -792,6 +900,7 @@ class DevEnvironmentManager:
                 container_name,
                 _DOCKER_CMD_TIMEOUT,
             )
+            return False
 
     # ------------------------------------------------------------------
     # Local process implementation

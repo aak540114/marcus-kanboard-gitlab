@@ -431,14 +431,19 @@ async def start_ticket_dev_environment(
         if url is None:
             return {"success": False, "error": "Failed to start dev environment"}
 
-        dev_info = wf._dev_env.get_info(ticket_id, provider)
+        # start_dev_environment() always registers the environment under
+        # the workflow's OWN configured provider (self._provider), not
+        # whatever the caller passed here — look it up the same way, or a
+        # caller-supplied `provider` that doesn't match silently returns
+        # port: None for an environment that actually started fine.
+        dev_info = wf._dev_env.get_info(ticket_id, wf._provider)
         return {
             "success": True,
             "result": {
                 "url": url,
                 "port": dev_info.port if dev_info else None,
                 "ticket_id": ticket_id,
-                "provider": provider,
+                "provider": wf._provider,
             },
         }
     except Exception as exc:  # noqa: BLE001

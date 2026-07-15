@@ -3132,6 +3132,58 @@ async def main() -> None:
         raise
 
 
+#: Cap on webhook request bodies (/webhooks/kanboard, /webhooks/gitea).
+#: Both routes are exempt from bearer-token auth — they authenticate via
+#: their own token/HMAC signature instead — and that check only runs
+#: AFTER the body is read. Without a cap, an unauthenticated caller could
+#: POST an arbitrarily large body and exhaust Marcus's memory before
+#: signature/token verification ever gets a chance to reject it. A real
+#: push-event JSON payload is a few KB; 1 MiB is generous headroom.
+_MAX_WEBHOOK_BODY_BYTES = 1 * 1024 * 1024
+
+
+async def _read_bounded_body(
+    request: Any, max_bytes: int = _MAX_WEBHOOK_BODY_BYTES
+) -> Optional[bytes]:
+    """Read a request body, refusing to buffer more than ``max_bytes``.
+
+    Checks ``Content-Length`` first (cheap — rejects most oversized
+    requests without reading anything), then also enforces the cap while
+    streaming, since ``Content-Length`` can be absent or understated
+    (chunked transfer encoding, or simply lying).
+
+    Parameters
+    ----------
+    request : Any
+        A Starlette ``Request`` (typed loosely / duck-typed so this stays
+        importable and testable without a hard Starlette dependency at
+        module scope — mirrors this file's other extracted helpers).
+    max_bytes : int
+        Maximum allowed body size in bytes.
+
+    Returns
+    -------
+    Optional[bytes]
+        The full body, or ``None`` if it exceeds ``max_bytes``.
+    """
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_bytes:
+                return None
+        except ValueError:
+            pass  # malformed header — fall through to the streaming cap
+
+    chunks: List[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _get_dev_env_settings_mgr(server: "MarcusServer") -> Any:
     """Return the shared DevEnvSettingsManager singleton, constructing it once.
 
@@ -3556,7 +3608,9 @@ if __name__ == "__main__":
             """Receive Kanboard push-webhook and re-emit as Marcus events."""
             token = request.query_params.get("token")
             header_token = request.headers.get("X-Kanboard-Token")
-            body = await request.body()
+            body = await _read_bounded_body(request)
+            if body is None:
+                return JSONResponse({"status": "rejected", "reason": "payload too large"}, status_code=413)
             accepted = await _webhook_receiver.handle_request(
                 body, token=token, header_token=header_token
             )
@@ -3591,7 +3645,9 @@ if __name__ == "__main__":
                 server._gitea_webhook_receiver = receiver  # type: ignore[attr-defined]
 
             signature = request.headers.get("X-Gitea-Signature")
-            body = await request.body()
+            body = await _read_bounded_body(request)
+            if body is None:
+                return JSONResponse({"status": "rejected", "reason": "payload too large"}, status_code=413)
             accepted = await receiver.handle_request(body, signature=signature)
             if accepted:
                 return JSONResponse({"status": "ok"}, status_code=200)

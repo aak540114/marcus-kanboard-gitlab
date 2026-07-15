@@ -189,6 +189,93 @@ class TestEnsureWebhook:
         assert mapping is not None
         assert wf.get_repo_for_project(1) is not None
 
+    @pytest.mark.asyncio
+    async def test_retries_webhook_on_next_lookup_after_a_failed_attempt(
+        self, tmp_path, gitea_mgr
+    ):
+        """A webhook that failed on first creation must not be permanently
+        given up on — the next ensure_repo() call for the same project
+        retries it."""
+        gitea_mgr.create_webhook = AsyncMock(side_effect=RuntimeError("gitea down"))
+        events = MagicMock()
+        wf = ProjectSyncWorkflow(
+            gitea_manager=gitea_mgr,
+            events=events,
+            repos_path=str(tmp_path / "project_repos.json"),
+            local_repos_base=str(tmp_path / "repos"),
+            webhook_target_url="http://marcus:8080/webhooks/gitea",
+            webhook_secret="s3cret",
+        )
+        await wf.ensure_repo(1, "Shopping Cart")
+        gitea_mgr.create_repo.assert_called_once()
+
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+        await wf.ensure_repo(1, "Shopping Cart")
+
+        gitea_mgr.create_webhook.assert_called_once_with(
+            "shopping-cart", "http://marcus:8080/webhooks/gitea", "s3cret"
+        )
+        gitea_mgr.create_repo.assert_called_once()  # still not re-created
+
+    @pytest.mark.asyncio
+    async def test_no_retry_once_webhook_confirmed(self, tmp_path, gitea_mgr):
+        """Once a webhook is confirmed created, subsequent lookups don't
+        re-attempt it — avoids a network round-trip on every cache hit."""
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+        events = MagicMock()
+        wf = ProjectSyncWorkflow(
+            gitea_manager=gitea_mgr,
+            events=events,
+            repos_path=str(tmp_path / "project_repos.json"),
+            local_repos_base=str(tmp_path / "repos"),
+            webhook_target_url="http://marcus:8080/webhooks/gitea",
+            webhook_secret="s3cret",
+        )
+        await wf.ensure_repo(1, "Shopping Cart")
+        gitea_mgr.create_webhook.reset_mock()
+
+        await wf.ensure_repo(1, "Shopping Cart")
+
+        gitea_mgr.create_webhook.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retries_webhook_for_a_mapping_persisted_before_webhook_support(
+        self, tmp_path, gitea_mgr
+    ):
+        """A mapping written to disk before this feature existed (or before
+        GITEA_WEBHOOK_TOKEN was set) has no webhook_created key at all —
+        the next lookup must still attempt to create the webhook."""
+        repos_path = tmp_path / "project_repos.json"
+        repos_path.write_text(
+            json.dumps(
+                {
+                    "kanboard:1": {
+                        "kanboard_project_id": 1,
+                        "kanboard_project_name": "Shopping Cart",
+                        "gitea_repo_url": "http://localhost:3000/root/shopping-cart.git",
+                        "local_repo_path": "./repos/shopping-cart",
+                    }
+                }
+            )
+        )
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+        events = MagicMock()
+        wf = ProjectSyncWorkflow(
+            gitea_manager=gitea_mgr,
+            events=events,
+            repos_path=str(repos_path),
+            local_repos_base=str(tmp_path / "repos"),
+            webhook_target_url="http://marcus:8080/webhooks/gitea",
+            webhook_secret="s3cret",
+        )
+
+        await wf.ensure_repo(1, "Shopping Cart")
+
+        gitea_mgr.create_webhook.assert_called_once_with(
+            "shopping-cart", "http://marcus:8080/webhooks/gitea", "s3cret"
+        )
+        gitea_mgr.create_repo.assert_not_called()
+
 
 class TestGetRepoForProject:
     def test_returns_none_when_unmapped(self, workflow):

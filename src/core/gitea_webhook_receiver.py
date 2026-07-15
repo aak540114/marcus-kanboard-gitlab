@@ -163,4 +163,14 @@ class GiteaWebhookReceiver:
         expected = hmac.new(
             self._secret.encode("utf-8"), body, hashlib.sha256
         ).hexdigest()
-        return hmac.compare_digest(expected, signature)
+        # Compare as bytes, not str: hmac.compare_digest() raises TypeError
+        # on a str containing non-ASCII characters, and the attacker
+        # controls `signature` (it comes from the raw X-Gitea-Signature
+        # header, decoded latin-1 by Starlette — bytes 0x80-0xFF become
+        # non-ASCII code points). Comparing UTF-8 bytes never raises on
+        # content, so a hostile header cleanly fails verification instead
+        # of crashing the request with a 500 (see the identical fix and
+        # rationale in src/core/agent_auth.py's bearer-token comparison).
+        return hmac.compare_digest(
+            expected.encode("utf-8"), signature.encode("utf-8")
+        )

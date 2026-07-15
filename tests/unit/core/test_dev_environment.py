@@ -5,7 +5,7 @@ Unit tests for src/core/dev_environment.py
 import socket
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -314,6 +314,21 @@ class TestBuildEntrypoint:
         assert "--reload" not in cmd
         assert "inotifywait" in cmd
 
+    def test_touches_ready_marker_after_checkout_before_install(self) -> None:
+        """The readiness marker is touched right after git checkout and
+        before install_cmd — refresh()'s _wait_until_ready polls for it
+        to avoid racing the entrypoint's own initial checkout."""
+        cmd = self._mgr()._build_entrypoint(
+            "ticket/k/5",
+            install_cmd="npm install",
+            start_cmd="npm run dev",
+            use_hm_reload=True,
+        )
+        checkout_idx = cmd.index("git checkout")
+        marker_idx = cmd.index("touch /tmp/.marcus-ready")
+        install_idx = cmd.index("npm install")
+        assert checkout_idx < marker_idx < install_idx
+
     def test_static_uses_inotifywait_wrapper(self) -> None:
         """Static stack wraps server with inotifywait restart loop."""
         cmd = self._mgr()._build_entrypoint(
@@ -553,6 +568,62 @@ class TestMaxParallelContainers:
 
 
 # ---------------------------------------------------------------------------
+# _wait_until_ready() — guards refresh() against racing the container's
+# own initial `git checkout` (see _build_entrypoint's readiness marker).
+# ---------------------------------------------------------------------------
+
+
+class TestWaitUntilReady:
+    @pytest.fixture
+    def manager(self, tmp_path):
+        config = DevEnvironmentConfig(repo_path=str(tmp_path), use_docker=True)
+        return DevEnvironmentManager(
+            config=config, settings_manager=DevEnvSettingsManager(data_dir=tmp_path)
+        )
+
+    @pytest.mark.asyncio
+    async def test_ready_on_first_check_returns_true_immediately(self, manager):
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0)
+        ) as mock_run, patch("asyncio.sleep") as mock_sleep:
+            result = await manager._wait_until_ready("c1")
+        assert result is True
+        mock_run.assert_called_once()
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_polls_until_marker_appears(self, manager):
+        results = [MagicMock(returncode=1), MagicMock(returncode=1), MagicMock(returncode=0)]
+        with patch("subprocess.run", side_effect=results) as mock_run, patch(
+            "asyncio.sleep", new=AsyncMock()
+        ) as mock_sleep:
+            result = await manager._wait_until_ready("c1")
+        assert result is True
+        assert mock_run.call_count == 3
+        assert mock_sleep.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_false_after_exhausting_poll_budget(self, manager):
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=1)
+        ) as mock_run, patch("asyncio.sleep", new=AsyncMock()):
+            result = await manager._wait_until_ready("c1")
+        assert result is False
+        assert mock_run.call_count == 5  # _READY_POLL_MAX_ATTEMPTS
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_false_immediately_without_retry(self, manager):
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["docker", "exec"], timeout=60),
+        ) as mock_run, patch("asyncio.sleep") as mock_sleep:
+            result = await manager._wait_until_ready("c1")
+        assert result is False
+        mock_run.assert_called_once()
+        mock_sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # refresh() — instant webhook-driven reload trigger
 # ---------------------------------------------------------------------------
 
@@ -604,12 +675,33 @@ class TestRefresh:
         with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")):
             await docker_manager.start("T-32", "kanboard", "feature/y")
 
-        with patch(
-            "subprocess.run",
-            return_value=MagicMock(returncode=1, stderr="fatal: not a repo"),
-        ):
+        def _side_effect(cmd, **kwargs):
+            if "test -f" in cmd[-1]:
+                return MagicMock(returncode=0, stderr="")  # ready — skip past the poll
+            return MagicMock(returncode=1, stderr="fatal: not a repo")
+
+        with patch("subprocess.run", side_effect=_side_effect):
             ok = await docker_manager.refresh("T-32", "kanboard")
         assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_skips_git_command_when_container_not_ready(self, docker_manager):
+        """refresh() must not run git fetch/reset before the entrypoint's
+        own initial checkout has finished (see _wait_until_ready) — a
+        push arriving while the container is still installing
+        dependencies must not race that checkout."""
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")):
+            await docker_manager.start("T-45", "kanboard", "feature/z")
+
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=1)
+        ) as mock_run, patch("asyncio.sleep", new=AsyncMock()):
+            ok = await docker_manager.refresh("T-45", "kanboard")
+
+        assert ok is False
+        # Only the readiness-check command should have run — never fetch/reset.
+        for call in mock_run.call_args_list:
+            assert "git fetch" not in call.args[0][-1]
 
     @pytest.mark.asyncio
     async def test_returns_false_for_local_non_docker_env(self, tmp_path):
@@ -679,9 +771,12 @@ class TestDockerCommandTimeouts:
 
     @pytest.mark.asyncio
     async def test_stop_docker_timeout_does_not_raise(self, docker_manager):
-        """A hung `docker stop` is best-effort — stop() still completes."""
+        """A hung `docker stop` doesn't raise, but must NOT report success —
+        the container's real state is unknown, so bookkeeping (and the
+        allocated port) stays intact rather than being freed for reuse and
+        colliding with a container that may still actually be running."""
         with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")):
-            await docker_manager.start("T-42", "kanboard", "ticket/kanboard/t-42")
+            info = await docker_manager.start("T-42", "kanboard", "ticket/kanboard/t-42")
 
         with patch(
             "subprocess.run",
@@ -689,8 +784,28 @@ class TestDockerCommandTimeouts:
         ):
             stopped = await docker_manager.stop("T-42", "kanboard")
 
+        assert stopped is False
+        assert docker_manager.get_info("T-42", "kanboard") is not None
+        assert info.port in docker_manager._allocator._in_use
+
+    @pytest.mark.asyncio
+    async def test_stop_retry_succeeds_after_a_timed_out_attempt(self, docker_manager):
+        """A subsequent stop() call can still find and successfully stop
+        the environment a prior timed-out attempt left tracked."""
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")):
+            await docker_manager.start("T-44", "kanboard", "ticket/kanboard/t-44")
+
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["docker", "stop"], timeout=60),
+        ):
+            await docker_manager.stop("T-44", "kanboard")
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")):
+            stopped = await docker_manager.stop("T-44", "kanboard")
+
         assert stopped is True
-        assert docker_manager.get_info("T-42", "kanboard") is None
+        assert docker_manager.get_info("T-44", "kanboard") is None
 
     @pytest.mark.asyncio
     async def test_refresh_timeout_returns_false(self, docker_manager):

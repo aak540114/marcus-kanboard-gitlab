@@ -89,6 +89,17 @@ class TestSignatureValidation:
         result = await secured_receiver.handle_request(body, signature=sig)
         assert result is False
 
+    @pytest.mark.asyncio
+    async def test_non_ascii_signature_rejected_not_crashed(self, secured_receiver):
+        """A crafted non-ASCII X-Gitea-Signature must be cleanly rejected,
+        not crash the request: hmac.compare_digest() raises TypeError on a
+        str containing non-ASCII characters when compared as str — the
+        header (decoded latin-1 by Starlette) is attacker-controlled and
+        can contain such characters (e.g. a raw 0xFF byte -> U+00FF)."""
+        body = _push_body("ticket/kanboard/42")
+        result = await secured_receiver.handle_request(body, signature="ab\xffcd")
+        assert result is False
+
 
 # ---------------------------------------------------------------------------
 # Malformed payloads

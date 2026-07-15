@@ -150,8 +150,18 @@ class ProjectSyncWorkflow:
         """
         key = f"kanboard:{project_id}"
         if key in self._mapping:
-            logger.debug("Project %d already mapped — skipping", project_id)
-            return dict(self._mapping[key])
+            cached = self._mapping[key]
+            if not cached.get("webhook_created"):
+                # The repo may have been provisioned before
+                # GITEA_WEBHOOK_TOKEN was set (or before Marcus was
+                # restarted with it), or a prior attempt may have failed —
+                # retry on every lookup until it's confirmed, rather than
+                # leaving this project permanently without a webhook.
+                slug = _slugify(cached.get("kanboard_project_name") or project_name)
+                cached["webhook_created"] = await self._ensure_webhook(slug)
+                self._save_mapping()
+            logger.debug("Project %d already mapped — skipping repo creation", project_id)
+            return dict(cached)
 
         slug = _slugify(project_name)
         local_path = os.path.join(self._local_repos_base, slug)
@@ -168,13 +178,14 @@ class ProjectSyncWorkflow:
             )
             return None
 
-        await self._ensure_webhook(slug)
+        webhook_created = await self._ensure_webhook(slug)
 
         self._mapping[key] = {
             "kanboard_project_id": project_id,
             "kanboard_project_name": project_name,
             "gitea_repo_url": clone_url,
             "local_repo_path": local_path,
+            "webhook_created": webhook_created,
         }
         self._save_mapping()
         logger.info(
@@ -186,27 +197,36 @@ class ProjectSyncWorkflow:
         )
         return dict(self._mapping[key])
 
-    async def _ensure_webhook(self, slug: str) -> None:
+    async def _ensure_webhook(self, slug: str) -> bool:
         """Create the push webhook for a repo, if configured.
 
         Failures are logged and swallowed — a missing webhook degrades
         the dev-environment refresh from instant to never (until the next
-        ``setup.sh`` run recreates it), but must not block repo creation
-        or ticket work.
+        successful retry), but must not block repo creation or ticket work.
 
         Parameters
         ----------
         slug : str
             URL-safe repository name.
+
+        Returns
+        -------
+        bool
+            ``True`` if a webhook now exists (created, already present,
+            or webhook creation isn't configured — nothing to retry).
+            ``False`` only on an actual failure, so ``ensure_repo`` can
+            retry on the next lookup instead of giving up permanently.
         """
         if not self._webhook_target_url or not self._webhook_secret:
-            return
+            return True  # not configured — nothing to retry
         try:
             await self._gitea.create_webhook(
                 slug, self._webhook_target_url, self._webhook_secret
             )
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to create Gitea webhook for %s: %s", slug, exc)
+            return False
 
     # ------------------------------------------------------------------
     # Public query API
