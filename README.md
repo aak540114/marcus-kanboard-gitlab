@@ -351,6 +351,12 @@ Clicking **Open** in a ticket's **Marcus Dev Environment** panel (or visiting `/
 
 **Resource limit:** the board header's "Max dev environments" `[−] N [+]` counter (backed by `/api/dev-env-setting`) caps how many of these containers can run at once, globally. Once the limit is hit, `/dev-env/view` returns an error until an existing environment is stopped — `∞` (the default) means no limit.
 
+**Safety and robustness (hardened after an adversarial review pass):**
+- `/dev-env/view` verifies a ticket actually belongs to the `project_id` it's given (via a live Kanboard lookup) before auto-provisioning that project's Gitea repo/webhook — a stray or spoofed `project_id` can't force-create a repo for a project it isn't tied to.
+- Every `docker run`/`exec`/`stop` call has a 60-second timeout, so an unresponsive Docker daemon fails that request instead of hanging it (and, before this fix, the ASGI worker thread behind it) indefinitely.
+- `/webhooks/kanboard` and `/webhooks/gitea` cap request body size before reading it into memory — both are intentionally exempt from `MARCUS_AGENT_TOKEN` bearer auth (they authenticate via their own token/HMAC signature instead), so an oversized POST is rejected (`413`) before that check ever has a chance to run.
+- `refresh()` waits for a readiness marker the dev-env container writes right after its own first `git checkout`, so a push landing while the container is still installing dependencies can't race that checkout.
+
 ---
 
 ## Independent deployment
