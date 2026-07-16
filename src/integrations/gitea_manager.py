@@ -158,13 +158,14 @@ class GiteaManager:
             raise RuntimeError("GiteaManager not connected — call connect() first")
 
         slug = _slugify(name)
-        owner = self._namespace
+        # connect() guarantees _namespace is resolved (falls back to the
+        # token owner's username); the "or ''" only narrows the Optional
+        # for mypy — the RuntimeError above fires first when unconnected.
+        owner = self._namespace or ""
 
         if await self.repo_exists(slug):
             logger.info("Gitea repo %r already exists — skipping creation", slug)
-            r = await self._client.get(f"{self._base}/api/v1/repos/{owner}/{slug}")
-            r.raise_for_status()
-            return str(r.json()["clone_url"])
+            return self._clone_url(owner, slug)
 
         payload: Dict[str, Any] = {
             "name": slug,
@@ -183,9 +184,39 @@ class GiteaManager:
 
         r = await self._client.post(create_url, json=payload)
         r.raise_for_status()
-        clone_url: str = r.json()["clone_url"]
+        clone_url = self._clone_url(owner, slug)
         logger.info("Created Gitea repo %s", clone_url)
         return clone_url
+
+    def _clone_url(self, owner: str, slug: str) -> str:
+        """Build the HTTP clone URL from Marcus's own configured Gitea URL.
+
+        Deliberately NOT the ``clone_url`` field from Gitea's API response:
+        Gitea composes that from its browser-facing ``ROOT_URL`` config
+        (``http://localhost:3000/`` in ``docker-compose.yml``) no matter
+        what address the API caller used — with the default
+        ``PUBLIC_URL_DETECTION = legacy`` there is no request-host
+        fallback. In Docker mode Marcus reaches Gitea at
+        ``http://gitea:3000``, so a ROOT_URL-derived clone URL points at
+        ``localhost:3000`` *inside the marcus container*, where nothing
+        listens — the initial ``git push`` in ``init_with_readme()`` would
+        get connection-refused and the project would never receive a repo
+        mapping. Deriving from ``self._base`` (the address Marcus itself is
+        configured to reach Gitea on) is correct in every run mode.
+
+        Parameters
+        ----------
+        owner : str
+            Repository owner (user or organisation namespace).
+        slug : str
+            URL-safe repository name.
+
+        Returns
+        -------
+        str
+            e.g. ``http://gitea:3000/root/shopping-cart.git``.
+        """
+        return f"{self._base}/{owner}/{slug}.git"
 
     async def create_webhook(self, slug: str, target_url: str, secret: str) -> bool:
         """Create a push webhook on a repo, idempotently.

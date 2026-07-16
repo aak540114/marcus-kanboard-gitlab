@@ -248,6 +248,56 @@ class TestCreateRepo:
         assert url == "http://localhost:3000/root/my-app.git"
         mgr._client.post.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_clone_url_derived_from_configured_base_not_root_url(self):
+        """The returned clone URL must use Marcus's own GITEA_URL, not
+        the server-reported clone_url.
+
+        Gitea builds the API's clone_url from its browser-facing ROOT_URL
+        config (http://localhost:3000/ in docker-compose.yml) regardless of
+        the address the API caller used. In Docker mode Marcus reaches
+        Gitea at http://gitea:3000 — pushing to a localhost:3000 clone_url
+        from inside the marcus container hits nothing and the initial push
+        fails, so the project never gets a repo mapping. The URL Marcus
+        pushes to must therefore be derived from the URL Marcus itself is
+        configured to reach Gitea on.
+        """
+        mgr = GiteaManager("http://gitea:3000", "tok", namespace="root")
+        mgr._username = "root"
+        mgr._client = AsyncMock()
+        mgr._client.get = AsyncMock(
+            return_value=_mock_response({"message": "not found"}, status_code=404)
+        )
+        # Server reports the ROOT_URL-based clone_url (browser-facing).
+        mgr._client.post = AsyncMock(
+            return_value=_mock_response(
+                {"clone_url": "http://localhost:3000/root/my-app.git"}
+            )
+        )
+
+        url = await mgr.create_repo("My App")
+
+        assert url == "http://gitea:3000/root/my-app.git"
+
+    @pytest.mark.asyncio
+    async def test_existing_repo_clone_url_also_derived_from_base(self):
+        """The already-exists path derives the URL the same way (and needs
+        no second GET — existence was already confirmed)."""
+        mgr = GiteaManager("http://gitea:3000", "tok", namespace="root")
+        mgr._username = "root"
+        mgr._client = AsyncMock()
+        mgr._client.get = AsyncMock(
+            return_value=_mock_response(
+                {"clone_url": "http://localhost:3000/root/my-app.git"}
+            )
+        )
+        mgr._client.post = AsyncMock()
+
+        url = await mgr.create_repo("My App")
+
+        assert url == "http://gitea:3000/root/my-app.git"
+        mgr._client.post.assert_not_called()
+
 
 class TestCreateWebhook:
     @pytest.mark.asyncio

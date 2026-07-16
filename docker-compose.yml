@@ -129,6 +129,21 @@ services:
       GITEA__server__DOMAIN: localhost
       GITEA__server__ROOT_URL: "http://localhost:3000/"
       GITEA__service__DISABLE_REGISTRATION: "true"
+      # REQUIRED for the push webhook to ever be delivered. Gitea's
+      # default webhook allow-list is "external" (public-internet hosts
+      # only, an SSRF guard) — it silently refuses to dial private
+      # addresses at DELIVERY time, while hook CREATION succeeds with no
+      # error. Both of Marcus's webhook targets are private: the Docker
+      # service name (http://marcus:4298/webhooks/gitea → a 172.x compose
+      # network IP) and hybrid mode's host.docker.internal (host-gateway
+      # → bridge IP, also private). Without this, "instant refresh" of
+      # dev environments never fires and the only evidence is Gitea's
+      # per-hook "Recent Deliveries" UI. Scoped to the [webhook] section
+      # so migrations/other subsystems keep the stricter default.
+      # Acceptable here: a single-admin local stack — only the admin can
+      # define hooks, so the SSRF concern this default protects against
+      # doesn't apply.
+      GITEA__webhook__ALLOWED_HOST_LIST: "external,private,loopback"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/v1/version"]
       interval: 10s

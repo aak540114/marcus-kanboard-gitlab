@@ -67,6 +67,16 @@ services:
       GITEA__server__DOMAIN: "${GITEA_DOMAIN:-localhost}"
       GITEA__server__ROOT_URL: "${GITEA_EXTERNAL_URL:-http://localhost:3000/}"
       GITEA__service__DISABLE_REGISTRATION: "true"
+      # Gitea only DELIVERS webhooks to hosts on this allow-list; the
+      # default "external" (public-internet addresses only, an SSRF
+      # guard) is kept here because this file targets a dedicated public
+      # server. If your Marcus's webhook target URL is a PRIVATE address
+      # (VPN/LAN IP, Docker service name), deliveries are silently
+      # refused at dial time even though hook creation succeeds — set
+      # GITEA_WEBHOOK_ALLOWED_HOSTS to e.g. "external,private" (or the
+      # specific hostname) to allow them. The main docker-compose.yml
+      # (all-in-one local stack) overrides this out of the box.
+      GITEA__webhook__ALLOWED_HOST_LIST: "${GITEA_WEBHOOK_ALLOWED_HOSTS:-external}"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/v1/version"]
       interval: 30s
