@@ -1,6 +1,9 @@
 <?php
 /**
- * MarcusDevEnv board header template — injected at the top of every board view.
+ * MarcusDevEnv board header template — injected via Kanboard's
+ * 'template:project:header:after' hook, which fires on every
+ * project-scoped view (board, list, calendar, Gantt, search), not just
+ * the board — Kanboard has no board-only equivalent of this hook.
  *
  * Section 1 — Active AI Agents badge (polls /api/active-agents every 15 s)
  * Section 2 — Project Description link button

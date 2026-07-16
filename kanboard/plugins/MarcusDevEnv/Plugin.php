@@ -7,10 +7,11 @@ use Kanboard\Core\Plugin\Base;
 /**
  * MarcusDevEnv — Kanboard plugin
  *
- * Adds a "View Live Changes" sidebar button to every task.
- * Clicking the button calls the Marcus HTTP endpoint that spins up
- * (or looks up an already-running) dev environment for that ticket
- * and redirects the browser to the hot-reload URL.
+ * Adds a "View Live Changes" sidebar button to every task, plus a row of
+ * Marcus controls (active-agents badge, project description link, gate
+ * toggle, AI-verify counter, max-dev-envs counter) injected via the
+ * project header, which is shared by every project-scoped view (board,
+ * list, calendar, Gantt, search) — so it isn't limited to the board.
  *
  * Configuration
  * -------------
@@ -28,8 +29,16 @@ class Plugin extends Base
             'template:task:sidebar:information',
             'MarcusDevEnv:task/sidebar'
         );
+        // 'template:board:private:header' does not exist in Kanboard (verified
+        // against app/Template/board/view_private.php and table_container.php,
+        // both on master and the v1.2.52 release tag actually shipped by the
+        // kanboard/kanboard:latest Docker image — neither fires any hook near
+        // the board header). 'template:project:header:after' is the real hook
+        // fired at the end of app/Template/project_header/header.php, which
+        // every project-scoped view renders — this is what actually reaches
+        // the page.
         $this->template->hook->attach(
-            'template:board:private:header',
+            'template:project:header:after',
             'MarcusDevEnv:board/header'
         );
     }
