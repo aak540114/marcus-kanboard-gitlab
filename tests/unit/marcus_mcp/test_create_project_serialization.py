@@ -53,7 +53,7 @@ def _build_state() -> Mock:
     state = Mock()
     state.log_event = Mock()
     state.kanban_client = Mock()
-    state.kanban_client.provider = KanbanProvider.PLANKA
+    state.kanban_client.provider = KanbanProvider.KANBOARD
     state.kanban_client.project_id = "stale-id-must-not-leak-between-calls"
     state.kanban_client.board_id = "stale-board-id"
     state.ai_engine = Mock()

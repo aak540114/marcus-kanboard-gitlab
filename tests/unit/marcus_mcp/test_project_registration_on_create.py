@@ -7,9 +7,23 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _mock_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Ensure CLAUDE_API_KEY is set so config validation passes."""
-    monkeypatch.setenv("CLAUDE_API_KEY", "test-key-for-unit-tests")
+def _stub_marcus_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inject a pre-built MarcusConfig stub.
+
+    The wrapper hits ``get_config()`` on the create_project path
+    (kanban provider lookup, snapshot writer). On a fresh checkout
+    without ``config_marcus.json``, ``MarcusConfig.from_file()``
+    falls back to defaults whose ``ai.anthropic_api_key`` is None,
+    and ``validate()`` then raises. Setting ``CLAUDE_API_KEY`` in env
+    is not sufficient — substitution only fires when a config file is
+    actually loaded. Patch the module-level singleton directly so the
+    test is hermetic on any developer machine and in CI.
+    """
+    from src.config import marcus_config as mc
+
+    stub = mc.MarcusConfig()
+    stub.ai.anthropic_api_key = "test-key-for-unit-tests"
+    monkeypatch.setattr(mc, "_config", stub)
 
 
 @pytest.fixture(autouse=True)
@@ -42,7 +56,7 @@ async def test_create_project_registers_with_project_registry() -> None:
     state = Mock()
     state.log_event = Mock()
     state.kanban_client = Mock()
-    state.kanban_client.provider = KanbanProvider.PLANKA
+    state.kanban_client.provider = KanbanProvider.KANBOARD
     state.kanban_client.project_id = "1670692878487127607"
     state.kanban_client.board_id = "1670692878621345337"
     state.ai_engine = Mock()
@@ -85,7 +99,7 @@ async def test_create_project_registers_with_project_registry() -> None:
         result = await create_project(
             description="Build a flight simulator game",
             project_name="Flight Simulator",
-            options={"provider": "planka"},
+            options={"provider": "kanboard"},
             state=state,
         )
 
@@ -95,13 +109,13 @@ async def test_create_project_registers_with_project_registry() -> None:
 
         # Verify ProjectConfig was created correctly
         assert call_args.name == "Flight Simulator - Main Board"
-        assert call_args.provider == "planka"
+        assert call_args.provider == "kanboard"
         assert call_args.provider_config["project_id"] == "1670692878487127607"
         assert call_args.provider_config["board_id"] == "1670692878621345337"
         assert call_args.provider_config["project_name"] == "Flight Simulator"
         assert call_args.provider_config["board_name"] == "Main Board"
         assert "auto-created" in call_args.tags
-        assert "planka" in call_args.tags
+        assert "kanboard" in call_args.tags
 
         # Verify project was switched to (may be called more than once)
         state.project_manager.switch_project.assert_called_with(marcus_project_id)

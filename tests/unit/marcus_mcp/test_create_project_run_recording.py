@@ -62,7 +62,7 @@ def _build_state(cost_store: Any) -> Mock:
     state = Mock()
     state.log_event = Mock()
     state.kanban_client = Mock()
-    state.kanban_client.provider = KanbanProvider.PLANKA
+    state.kanban_client.provider = KanbanProvider.KANBOARD
     state.kanban_client.project_id = "1670692878487127607"
     state.kanban_client.board_id = "1670692878621345337"
     state.ai_engine = Mock()
@@ -133,7 +133,7 @@ class TestRunRecording:
             result = await create_project(
                 description="Build a flight simulator",
                 project_name="Flight Simulator",
-                options={"provider": "planka"},
+                options={"provider": "kanboard"},
                 state=state,
             )
 
@@ -165,7 +165,7 @@ class TestRunRecording:
             result = await create_project(
                 description="x",
                 project_name="Will Fail",
-                options={"provider": "planka"},
+                options={"provider": "kanboard"},
                 state=state,
             )
 
@@ -206,7 +206,7 @@ class TestRunRecording:
             await create_project(
                 description="x",
                 project_name="Flight Sim",
-                options={"provider": "planka"},
+                options={"provider": "kanboard"},
                 state=state,
             )
 
@@ -248,7 +248,7 @@ class TestCodexP2DedupReplay:
             first = await create_project(
                 description="Build a flight simulator",
                 project_name="Flight Simulator",
-                options={"provider": "planka"},
+                options={"provider": "kanboard"},
                 state=state,
             )
             # Two retries within the dedup window — both hit the
@@ -256,13 +256,13 @@ class TestCodexP2DedupReplay:
             second = await create_project(
                 description="Build a flight simulator",
                 project_name="Flight Simulator",
-                options={"provider": "planka"},
+                options={"provider": "kanboard"},
                 state=state,
             )
             third = await create_project(
                 description="Build a flight simulator",
                 project_name="Flight Simulator",
-                options={"provider": "planka"},
+                options={"provider": "kanboard"},
                 state=state,
             )
 
@@ -312,7 +312,7 @@ class TestCodexP2DedupReplay:
                 await nlp_mod.create_project(
                     description="Build a flight simulator",
                     project_name="Flight Simulator",
-                    options={"provider": "planka"},
+                    options={"provider": "kanboard"},
                     state=state,
                 )
 
@@ -387,7 +387,7 @@ class TestPathDiscriminator:
                 description="x",
                 project_name="P",
                 # No 'path' in options — must default to 'direct'.
-                options={"provider": "planka"},
+                options={"provider": "kanboard"},
                 state=state,
             )
         path = cost_store.conn.execute("SELECT path FROM runs").fetchone()[0]
@@ -410,7 +410,7 @@ class TestPathDiscriminator:
             await create_project(
                 description="x",
                 project_name="P",
-                options={"provider": "planka", "path": "marcus"},
+                options={"provider": "kanboard", "path": "marcus"},
                 state=state,
             )
         path = cost_store.conn.execute("SELECT path FROM runs").fetchone()[0]
@@ -433,7 +433,7 @@ class TestPathDiscriminator:
             await create_project(
                 description="x",
                 project_name="P",
-                options={"provider": "planka", "path": "posidonius"},
+                options={"provider": "kanboard", "path": "posidonius"},
                 state=state,
             )
         path = cost_store.conn.execute("SELECT path FROM runs").fetchone()[0]
@@ -466,7 +466,7 @@ class TestDecomposerDiscriminator:
             await create_project(
                 description="x",
                 project_name="P",
-                options={"provider": "planka", "decomposer": "feature_based"},
+                options={"provider": "kanboard", "decomposer": "feature_based"},
                 state=state,
             )
         decomposer = cost_store.conn.execute("SELECT decomposer FROM runs").fetchone()[
@@ -491,7 +491,7 @@ class TestDecomposerDiscriminator:
             await create_project(
                 description="x",
                 project_name="P",
-                options={"provider": "planka", "decomposer": "contract_first"},
+                options={"provider": "kanboard", "decomposer": "contract_first"},
                 state=state,
             )
         decomposer = cost_store.conn.execute("SELECT decomposer FROM runs").fetchone()[
@@ -520,7 +520,7 @@ class TestDecomposerDiscriminator:
             await create_project(
                 description="x",
                 project_name="P",
-                options={"provider": "planka", "decomposer": "not_a_real_strategy"},
+                options={"provider": "kanboard", "decomposer": "not_a_real_strategy"},
                 state=state,
             )
         decomposer = cost_store.conn.execute("SELECT decomposer FROM runs").fetchone()[
@@ -561,7 +561,7 @@ class TestDecomposerDiscriminator:
                 description="x",
                 project_name="P",
                 # Caller asked for contract_first…
-                options={"provider": "planka", "decomposer": "contract_first"},
+                options={"provider": "kanboard", "decomposer": "contract_first"},
                 state=state,
             )
         decomposer = cost_store.conn.execute("SELECT decomposer FROM runs").fetchone()[
@@ -593,7 +593,7 @@ class TestDecomposerDiscriminator:
             await create_project(
                 description="x",
                 project_name="P",
-                options={"provider": "planka", "decomposer": "feature_based"},
+                options={"provider": "kanboard", "decomposer": "feature_based"},
                 state=state,
             )
         decomposer = cost_store.conn.execute("SELECT decomposer FROM runs").fetchone()[
