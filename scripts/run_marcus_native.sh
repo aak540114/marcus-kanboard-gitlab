@@ -138,6 +138,23 @@ export CLAUDE_API_KEY="$(env_get CLAUDE_API_KEY)"
 bind_host="$(env_get MARCUS_BIND_HOST)"
 export MARCUS_NATIVE_BIND_HOST="${bind_host:-127.0.0.1}"
 
+# Linux-only caveat: the Kanboard/Gitea containers deliver webhooks to
+# native Marcus via host.docker.internal, which on Linux maps to the
+# Docker bridge gateway IP (via the extra_hosts host-gateway entries in
+# docker-compose.yml) — NOT loopback. A Marcus bound to 127.0.0.1 is
+# unreachable from that address, so webhooks silently never arrive and
+# everything falls back to BoardWatcher's slow poll cycle. macOS is fine:
+# Docker Desktop proxies host.docker.internal connections through the
+# host's own loopback, so a 127.0.0.1 bind still receives them.
+if [ "$(uname -s)" = "Linux" ] && [ "$MARCUS_NATIVE_BIND_HOST" = "127.0.0.1" ]; then
+    log "WARNING: On Linux, webhooks from the Kanboard/Gitea containers reach a native"
+    log "         Marcus via the Docker bridge gateway, which cannot connect to a server"
+    log "         bound to 127.0.0.1. Ticket moves will still work via polling (slower,"
+    log "         up to one poll interval of delay), but instant webhook delivery won't."
+    log "         Fix: set MARCUS_BIND_HOST=0.0.0.0 in .env (and firewall port 4298 if"
+    log "         this host is reachable from other machines), then re-run this script."
+fi
+
 export MARCUS_CONFIG="$SCRIPT_DIR/marcus.native.config.json"
 
 # Recorded so scripts/teardown.sh can find and stop this process later.
