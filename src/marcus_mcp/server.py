@@ -3586,6 +3586,7 @@ if __name__ == "__main__":
 
         import uvicorn
         from starlette.applications import Starlette
+        from starlette.middleware.cors import CORSMiddleware
         from starlette.requests import Request
         from starlette.responses import JSONResponse, RedirectResponse, HTMLResponse, Response
         from starlette.routing import Mount, Route
@@ -4378,6 +4379,38 @@ function save() {{
         # A pass-through when unset, preserving the localhost-only default.
         agent_token = get_agent_token()
         app = BearerAuthMiddleware(app, token=agent_token)  # type: ignore[assignment]  # noqa: E501
+
+        # CORS: the Kanboard plugin's browser-side JS (kanboard/plugins/
+        # MarcusDevEnv/Template/board/header.php and task/sidebar.php) calls
+        # these APIs cross-origin — Kanboard's own origin (e.g.
+        # http://localhost:8080) differs from Marcus's
+        # (http://localhost:4298), so scheme+host+port never all match.
+        # Every PUT here (gate-setting, dev-env-setting,
+        # project-description) sends `Content-Type: application/json`,
+        # which is not a CORS "simple" content type, so the browser sends a
+        # preflight OPTIONS request before the real one. None of these
+        # routes register an OPTIONS handler (methods=["PUT"] /
+        # ["GET", "PUT"] only), so that preflight hit Starlette's router,
+        # found no match, and got back a 405 with no CORS headers — the
+        # browser then blocked the real PUT before it ever reached the
+        # server, and fetch() rejected. Every call site's `.catch()` swallows
+        # that silently (`/* keep current visual state */`), which is why
+        # clicking the Project gate toggle, the AI Verify counter, or the
+        # Max dev environments counter visibly did nothing. Confirmed via a
+        # standalone repro: a PUT-only Starlette route rejects a simulated
+        # preflight with 405 and no CORS headers; adding this middleware
+        # fixes it.
+        #
+        # Wrapped OUTSIDE BearerAuthMiddleware (added last = outermost) so
+        # a preflight — which never carries the bearer token — is answered
+        # by CORSMiddleware before it would otherwise hit auth and get a 401.
+        app = CORSMiddleware(  # type: ignore[assignment]
+            app,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
         if agent_token:
             print("[I] Auth:           bearer token REQUIRED (MARCUS_AGENT_TOKEN set)")
         else:
