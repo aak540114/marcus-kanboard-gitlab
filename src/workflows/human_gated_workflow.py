@@ -357,7 +357,12 @@ class HumanGatedWorkflow:
                     and record.state == TicketState.WAITING_FOR_HUMAN
                 ):
                     # Human moved card from waiting_for_human → in_progress.
-                    # AI resumes work on the existing branch without re-claiming.
+                    # AI resumes work on the existing branch. Re-acquire the
+                    # claim (released at review-signal time): an unclaimed
+                    # IN_PROGRESS record would otherwise be "started" again
+                    # by BoardWatcher's poll echo of this same column move
+                    # — a duplicate claim plus a contradictory "Started"
+                    # comment right after this resume.
                     try:
                         self._lifecycle.transition(
                             ticket_id,
@@ -367,6 +372,25 @@ class HumanGatedWorkflow:
                         )
                     except InvalidTransitionError:
                         pass
+                    try:
+                        self._lifecycle.claim_ticket(
+                            ticket_id, self._provider, self._agent_id
+                        )
+                    except KeyError:
+                        pass
+                elif (
+                    record.state == TicketState.IN_PROGRESS
+                    and record.ai_agent_id is not None
+                ):
+                    # Work already in flight (e.g. the poll-path echo of a
+                    # webhook-handled column move — BoardWatcher snapshots
+                    # only update during polls, so every webhook-signalled
+                    # change re-fires once on the next poll). Nothing to do.
+                    logger.debug(
+                        "Ticket %s already claimed and in progress — "
+                        "ignoring redundant status event",
+                        ticket_id,
+                    )
                 else:
                     # Status changed to a workable state with a human owner → start.
                     await self._start_ai_work(ticket_id, record)
@@ -594,6 +618,14 @@ class HumanGatedWorkflow:
                 )
             except InvalidTransitionError:
                 pass
+            # Re-acquire the claim released at review-signal time — same
+            # reasoning as the column-move resume in _on_status_changed.
+            try:
+                self._lifecycle.claim_ticket(
+                    ticket_id, self._provider, self._agent_id
+                )
+            except KeyError:
+                pass
 
             # Move kanban column back to in progress.
             try:
@@ -633,17 +665,31 @@ class HumanGatedWorkflow:
         )
 
         if record.state in (TicketState.IN_PROGRESS, TicketState.WAITING_FOR_HUMAN):
-            try:
-                self._lifecycle.transition(
-                    ticket_id,
-                    self._provider,
-                    TicketState.IN_PROGRESS
-                    if record.state == TicketState.WAITING_FOR_HUMAN
-                    else TicketState.WAITING_FOR_HUMAN,
-                    reason="Acceptance criteria edited by human",
-                )
-            except InvalidTransitionError:
-                pass
+            # IN_PROGRESS stays IN_PROGRESS: the notification below says the
+            # AI will "re-read and adjust", which is exactly what happens —
+            # the agent keeps working against the updated AC. (An earlier
+            # version flipped IN_PROGRESS → WAITING_FOR_HUMAN here, which
+            # contradicted both the comment and the untouched board column,
+            # and bricked completion: signal_ready_for_review cannot legally
+            # transition WFH → WFH, so it returned False forever.)
+            # WAITING_FOR_HUMAN resumes to IN_PROGRESS with the claim
+            # re-acquired — the AC edit is the human's review feedback.
+            if record.state == TicketState.WAITING_FOR_HUMAN:
+                try:
+                    self._lifecycle.transition(
+                        ticket_id,
+                        self._provider,
+                        TicketState.IN_PROGRESS,
+                        reason="Acceptance criteria edited by human",
+                    )
+                except InvalidTransitionError:
+                    pass
+                try:
+                    self._lifecycle.claim_ticket(
+                        ticket_id, self._provider, self._agent_id
+                    )
+                except KeyError:
+                    pass
 
             comment = CommentFormatter.revision_requested(
                 ticket_id=ticket_id,
@@ -1371,7 +1417,7 @@ class HumanGatedWorkflow:
                     ticket_id,
                     self._provider,
                     TicketState.READY,
-                    reason="AI agent starting: ticket unassigned and workable",
+                    reason="AI agent starting: ticket assigned and workable",
                 )
             except InvalidTransitionError as exc:
                 logger.debug("Cannot transition to READY: %s", exc)
@@ -1388,6 +1434,32 @@ class HumanGatedWorkflow:
                 )
             except InvalidTransitionError as exc:
                 logger.error("Cannot transition to IN_PROGRESS: %s", exc)
+                self._lifecycle.release_ticket(ticket_id, self._provider)
+                return
+        elif record.state in (
+            TicketState.BLOCKED,
+            TicketState.WAITING_FOR_HUMAN,
+            TicketState.REOPENED,
+        ):
+            # Re-entry into work from a paused state (all three are legal
+            # AI transitions to IN_PROGRESS). Previously this method only
+            # advanced TODO/READY and silently left any other state in
+            # place while still claiming the ticket and posting "Started"
+            # — from BLOCKED or WAITING_FOR_HUMAN the ticket then became
+            # un-completable, because signal_ready_for_review cannot
+            # legally fire from those states. BLOCKED especially was a
+            # dead end: nothing else in the codebase ever executed
+            # BLOCKED → IN_PROGRESS, so even a human dragging the card
+            # out of the blocked column couldn't truly resume work.
+            try:
+                self._lifecycle.transition(
+                    ticket_id,
+                    self._provider,
+                    TicketState.IN_PROGRESS,
+                    reason=f"Work resuming from {record.state.value}",
+                )
+            except InvalidTransitionError as exc:
+                logger.error("Cannot resume to IN_PROGRESS: %s", exc)
                 self._lifecycle.release_ticket(ticket_id, self._provider)
                 return
 

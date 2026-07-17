@@ -401,6 +401,218 @@ class TestStatusChangedTrigger:
 
 
 # ---------------------------------------------------------------------------
+# Dead-end states: BLOCKED / WAITING_FOR_HUMAN re-entry into work
+# ---------------------------------------------------------------------------
+
+
+class TestDeadEndStateRecovery:
+    """Re-entering work from BLOCKED or WAITING_FOR_HUMAN must fully work.
+
+    _start_ai_work previously advanced the state machine only from
+    TODO/READY: for a BLOCKED or WFH record it would claim the ticket and
+    post "Started" while silently leaving the old state in place — and
+    signal_ready_for_review cannot legally fire from BLOCKED or WFH, so
+    the ticket became claimed, announced, and un-completable. BLOCKED was
+    a full dead end: no code path ever executed the (permitted)
+    BLOCKED → IN_PROGRESS transition.
+    """
+
+    def _blocked_ticket(self, workflow, lifecycle, tid):
+        lifecycle.get_or_create(tid, "kanboard")
+        lifecycle.transition(tid, "kanboard", TicketState.READY)
+        lifecycle.transition(tid, "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition(tid, "kanboard", TicketState.BLOCKED)
+        lifecycle.set_assignee(tid, "kanboard", "alice")
+        return lifecycle.get(tid, "kanboard")
+
+    @pytest.mark.asyncio
+    async def test_unblock_via_column_move_reaches_in_progress(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Human drags a blocked card to 'in progress' → record follows."""
+        rec = self._blocked_ticket(workflow, lifecycle, "70")
+
+        event = _make_event(
+            {"ticket_id": "70", "new_status": "in_progress",
+             "old_status": "blocked", "provider": "kanboard"}
+        )
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/70",
+        ):
+            await workflow._on_status_changed(event)
+
+        rec = lifecycle.get("70", "kanboard")
+        assert rec.state == TicketState.IN_PROGRESS
+        assert rec.ai_agent_id is not None
+
+    @pytest.mark.asyncio
+    async def test_wfh_unassign_reassign_reaches_in_progress(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """WFH ticket unassigned then reassigned → work resumes completable."""
+        lifecycle.get_or_create("71", "kanboard")
+        lifecycle.transition("71", "kanboard", TicketState.READY)
+        lifecycle.transition("71", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("71", "kanboard", TicketState.WAITING_FOR_HUMAN)
+
+        unassign = _make_event({"ticket_id": "71", "provider": "kanboard"})
+        await workflow._on_ticket_unassigned(unassign)
+
+        assign = _make_event(
+            {"ticket_id": "71", "assignee": "bob", "provider": "kanboard"}
+        )
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/71",
+        ):
+            await workflow._on_ticket_assigned(assign)
+
+        rec = lifecycle.get("71", "kanboard")
+        assert rec.state == TicketState.IN_PROGRESS
+        assert rec.ai_agent_id is not None
+
+
+# ---------------------------------------------------------------------------
+# AC edited mid-work: keep working, don't silently flip to WFH
+# ---------------------------------------------------------------------------
+
+
+class TestAcChangedMidWork:
+    """An AC edit while the agent works must not brick completion.
+
+    The old behavior flipped IN_PROGRESS → WAITING_FOR_HUMAN while the
+    posted comment said "I'll re-read them now and adjust" (i.e. AI
+    continues) and the board column stayed 'in progress' — then
+    signal_ready_for_review could never legally transition WFH → WFH and
+    returned False forever.
+    """
+
+    @pytest.mark.asyncio
+    async def test_in_progress_stays_in_progress(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """AC edit during IN_PROGRESS keeps the state and notifies."""
+        lifecycle.get_or_create("75", "kanboard")
+        lifecycle.transition("75", "kanboard", TicketState.READY)
+        lifecycle.transition("75", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.claim_ticket("75", "kanboard", workflow._agent_id)
+
+        event = _make_event(
+            {"ticket_id": "75", "new_ac_text": "- [ ] new AC",
+             "new_hash": "abc", "provider": "kanboard"}
+        )
+        await workflow._on_ac_changed(event)
+
+        rec = lifecycle.get("75", "kanboard")
+        assert rec.state == TicketState.IN_PROGRESS
+        assert rec.acceptance_criteria == "- [ ] new AC"
+        mock_kanban.add_comment.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_completion_still_possible_after_ac_edit(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """The agent can still hand off for review after an AC edit."""
+        lifecycle.get_or_create("76", "kanboard")
+        lifecycle.transition("76", "kanboard", TicketState.READY)
+        lifecycle.transition("76", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.claim_ticket("76", "kanboard", workflow._agent_id)
+
+        event = _make_event(
+            {"ticket_id": "76", "new_ac_text": "- [ ] new AC",
+             "new_hash": "abc", "provider": "kanboard"}
+        )
+        await workflow._on_ac_changed(event)
+
+        result = await workflow.signal_ready_for_review("76")
+
+        assert result is True
+        rec = lifecycle.get("76", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+
+
+# ---------------------------------------------------------------------------
+# Webhook/poll echo: WFH resume re-claims, no duplicate "Started"
+# ---------------------------------------------------------------------------
+
+
+class TestResumeReclaimAndEchoSuppression:
+    """WFH resumes re-acquire the claim so poll echoes can't double-start.
+
+    signal_ready_for_review releases the claim; the WFH → in-progress
+    resume paths previously did NOT re-claim, so BoardWatcher's poll echo
+    of the same column move (snapshots are only updated during polls)
+    found an unclaimed IN_PROGRESS record and ran _start_ai_work — a
+    fresh claim plus a duplicate, contradictory "Started" comment right
+    after the "resuming" comment.
+    """
+
+    def _wfh_ticket(self, workflow, lifecycle, tid):
+        lifecycle.get_or_create(tid, "kanboard")
+        lifecycle.transition(tid, "kanboard", TicketState.READY)
+        lifecycle.transition(tid, "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition(tid, "kanboard", TicketState.WAITING_FOR_HUMAN)
+        lifecycle.set_assignee(tid, "kanboard", "alice")
+        return lifecycle.get(tid, "kanboard")
+
+    @pytest.mark.asyncio
+    async def test_column_resume_reclaims(self, workflow, lifecycle):
+        """WFH → in-progress column move re-acquires the AI claim."""
+        self._wfh_ticket(workflow, lifecycle, "80")
+
+        event = _make_event(
+            {"ticket_id": "80", "new_status": "in_progress",
+             "old_status": "waiting_for_human", "provider": "kanboard"}
+        )
+        await workflow._on_status_changed(event)
+
+        rec = lifecycle.get("80", "kanboard")
+        assert rec.state == TicketState.IN_PROGRESS
+        assert rec.ai_agent_id == workflow._agent_id
+
+    @pytest.mark.asyncio
+    async def test_poll_echo_does_not_double_start(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """The poll's echo of the same move must not claim or comment again."""
+        self._wfh_ticket(workflow, lifecycle, "81")
+
+        webhook_event = _make_event(
+            {"ticket_id": "81", "new_status": "in_progress",
+             "old_status": "waiting_for_human", "provider": "kanboard"}
+        )
+        await workflow._on_status_changed(webhook_event)
+        comments_after_resume = mock_kanban.add_comment.call_count
+
+        # BoardWatcher's next poll diffs the same column change again, but
+        # by then the record is already IN_PROGRESS (not WFH).
+        echo_event = _make_event(
+            {"ticket_id": "81", "new_status": "in_progress",
+             "old_status": "waiting_for_human", "provider": "kanboard"}
+        )
+        await workflow._on_status_changed(echo_event)
+
+        assert mock_kanban.add_comment.call_count == comments_after_resume
+        mock_kanban.move_task_to_column.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_comment_resume_reclaims(self, workflow, lifecycle):
+        """A human reply to a WFH ticket also re-acquires the claim."""
+        self._wfh_ticket(workflow, lifecycle, "82")
+
+        event = _make_event(
+            {"ticket_id": "82", "comment_body": "please also add dark mode",
+             "comment_author": "alice", "provider": "kanboard"}
+        )
+        await workflow._on_comment_added(event)
+
+        rec = lifecycle.get("82", "kanboard")
+        assert rec.state == TicketState.IN_PROGRESS
+        assert rec.ai_agent_id == workflow._agent_id
+
+
+# ---------------------------------------------------------------------------
 # Review-signal ordering: no state change before the comment lands
 # ---------------------------------------------------------------------------
 
