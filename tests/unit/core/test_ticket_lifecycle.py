@@ -446,3 +446,76 @@ class TestReleaseStaleClaims:
         assert rec.ai_agent_id is None
         # A fresh agent can now claim it.
         assert m2.claim_ticket("S-5", "kanboard", "agent-new") is True
+
+
+class TestLoadResilience:
+    """One malformed record must not take down — or destroy — the rest.
+
+    _load previously wrapped the whole record loop in a single
+    try/except: record #3 of 40 failing to parse silently dropped
+    records #3-40, and the very next _save() rewrote the state file
+    with only the survivors — 38 tickets' claims, branch names, and
+    history irreversibly destroyed by one bad record.
+    """
+
+    def test_bad_record_does_not_drop_later_records(self, state_file):
+        """Records after a malformed one still load."""
+        import json as json_module
+
+        m1 = TicketLifecycleManager(state_file=state_file)
+        m1.get_or_create("A-1", "kanboard")
+        m1.get_or_create("A-2", "kanboard")
+        m1.get_or_create("A-3", "kanboard")
+
+        raw = json_module.load(open(state_file))
+        raw["kanboard:A-2"]["state"] = "not-a-real-state"
+        json_module.dump(raw, open(state_file, "w"))
+
+        m2 = TicketLifecycleManager(state_file=state_file)
+        assert m2.get("A-1", "kanboard") is not None
+        assert m2.get("A-3", "kanboard") is not None
+        assert m2.get("A-2", "kanboard") is None  # unparseable, not loaded
+
+    def test_bad_record_survives_the_next_save(self, state_file):
+        """The unparseable record's raw data is preserved on disk."""
+        import json as json_module
+
+        m1 = TicketLifecycleManager(state_file=state_file)
+        m1.get_or_create("B-1", "kanboard")
+        m1.get_or_create("B-2", "kanboard")
+
+        raw = json_module.load(open(state_file))
+        raw["kanboard:B-2"]["state"] = "future-schema-state"
+        json_module.dump(raw, open(state_file, "w"))
+
+        m2 = TicketLifecycleManager(state_file=state_file)
+        m2.get_or_create("B-3", "kanboard")  # triggers _save()
+
+        on_disk = json_module.load(open(state_file))
+        assert "kanboard:B-2" in on_disk  # NOT destroyed by the save
+        assert on_disk["kanboard:B-2"]["state"] == "future-schema-state"
+        assert "kanboard:B-3" in on_disk
+
+
+class TestBranchNameUnification:
+    """get_or_create's branch naming must match BranchManager's sanitizer.
+
+    Three independent producers of "the" branch name had drifted; the
+    lifecycle's own version replaced only '/' and spaces, passing '#',
+    '!' etc. straight into git branch names.
+    """
+
+    def test_special_chars_sanitized_like_make_branch_name(self, manager):
+        """A ticket id with git-hostile chars produces a clean branch."""
+        from src.core.git_branch_manager import BranchManager
+
+        rec = manager.get_or_create("PROJ#42", "jira")
+        assert rec.branch_name == BranchManager.make_branch_name(
+            "jira", "PROJ#42"
+        )
+        assert "#" not in rec.branch_name
+
+    def test_plain_numeric_id_unchanged(self, manager):
+        """The common Kanboard case keeps the familiar shape."""
+        rec = manager.get_or_create("42", "kanboard")
+        assert rec.branch_name == "ticket/kanboard/42"

@@ -243,6 +243,10 @@ class TicketLifecycleManager:
         """Initialise and load existing records from disk."""
         self._state_file = state_file
         self._records: Dict[str, TicketRecord] = {}
+        #: Raw dicts of records that failed to parse at load time (schema
+        #: drift, hand edits). Preserved verbatim by _save so one bad
+        #: record can never destroy the rest of the file — see _load.
+        self._unparsed_records: Dict[str, Any] = {}
         self._load()
 
     # ------------------------------------------------------------------
@@ -278,8 +282,14 @@ class TicketLifecycleManager:
         key = f"{provider}:{ticket_id}"
         if key not in self._records:
             if not branch_name:
-                safe_id = ticket_id.replace("/", "-").replace(" ", "-").lower()
-                branch_name = f"ticket/{provider}/{safe_id}"
+                # Single source of truth for branch naming: three
+                # independent producers had drifted (this one passed '#',
+                # '!' etc. straight into git branch names).
+                from src.core.git_branch_manager import BranchManager
+
+                branch_name = BranchManager.make_branch_name(
+                    provider, ticket_id
+                )
             record = TicketRecord(
                 ticket_id=ticket_id,
                 provider=provider,
@@ -836,25 +846,40 @@ class TicketLifecycleManager:
         try:
             with open(self._state_file) as fh:
                 raw: Dict[str, Any] = json.load(fh)
-            for key, d in raw.items():
-                self._records[key] = TicketRecord.from_dict(d)
-            logger.debug(
-                "Loaded %d ticket records from %s", len(self._records), self._state_file
-            )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to load ticket lifecycle state: %s", exc)
+            return
+        # Per-record parsing: a single malformed record (schema drift,
+        # hand edit) previously aborted the WHOLE loop — every record
+        # after it silently vanished, and the next _save() then rewrote
+        # the file with only the survivors, irreversibly destroying the
+        # rest. Now each bad record is kept verbatim in
+        # _unparsed_records (merged back into every save) and everything
+        # else loads normally.
+        for key, d in raw.items():
+            try:
+                self._records[key] = TicketRecord.from_dict(d)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Skipping unparseable ticket record %s (%s) — its raw "
+                    "data is preserved in the state file untouched",
+                    key,
+                    exc,
+                )
+                self._unparsed_records[key] = d
+        logger.debug(
+            "Loaded %d ticket records from %s", len(self._records), self._state_file
+        )
 
     def _save(self) -> None:
         """Persist all records to the JSON state file."""
         os.makedirs(os.path.dirname(self._state_file) or ".", exist_ok=True)
         tmp = self._state_file + ".tmp"
         try:
+            payload: Dict[str, Any] = dict(self._unparsed_records)
+            payload.update({k: v.to_dict() for k, v in self._records.items()})
             with open(tmp, "w") as fh:
-                json.dump(
-                    {k: v.to_dict() for k, v in self._records.items()},
-                    fh,
-                    indent=2,
-                )
+                json.dump(payload, fh, indent=2)
             os.replace(tmp, self._state_file)
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to save ticket lifecycle state: %s", exc)

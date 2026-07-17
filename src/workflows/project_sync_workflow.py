@@ -157,17 +157,49 @@ class ProjectSyncWorkflow:
                 # restarted with it), or a prior attempt may have failed —
                 # retry on every lookup until it's confirmed, rather than
                 # leaving this project permanently without a webhook.
-                slug = _slugify(cached.get("kanboard_project_name") or project_name)
+                # Prefer the stored slug: for disambiguated or empty-name
+                # repos, re-slugifying the project name yields the WRONG
+                # repo. Fall back to name-derived for pre-repo_slug files.
+                slug = cached.get("repo_slug") or _slugify(
+                    cached.get("kanboard_project_name") or project_name
+                )
                 cached["webhook_created"] = await self._ensure_webhook(slug)
                 self._save_mapping()
             logger.debug("Project %d already mapped — skipping repo creation", project_id)
             return dict(cached)
 
         slug = _slugify(project_name)
+        # Disambiguate before creating: create_repo() treats "repo already
+        # exists" as "already provisioned" and returns the existing repo's
+        # URL, so a slug collision with a DIFFERENT project ("My App" vs
+        # "my app!") would silently cross-wire both projects into one repo
+        # and one local clone — both projects' ticket branches merging
+        # into one main, with no error anywhere. An all-symbol name
+        # slugifies to "" and would permanently fail provisioning instead.
+        taken_slugs = {
+            os.path.basename(m.get("local_repo_path", ""))
+            for k, m in self._mapping.items()
+            if k != key
+        }
+        if not slug:
+            slug = f"project-{project_id}"
+        elif slug in taken_slugs:
+            logger.warning(
+                "Project %d (%r) slugifies to %r, already used by another "
+                "project — disambiguating to %r",
+                project_id,
+                project_name,
+                slug,
+                f"{slug}-p{project_id}",
+            )
+            slug = f"{slug}-p{project_id}"
         local_path = os.path.join(self._local_repos_base, slug)
 
         try:
-            clone_url = await self._gitea.create_repo(project_name, description)
+            # Pass the (possibly disambiguated) slug, not the raw name —
+            # create_repo slugifies its argument, and _slugify is
+            # idempotent on an already-slugified string.
+            clone_url = await self._gitea.create_repo(slug, description)
             await self._gitea.init_with_readme(clone_url, local_path)
         except Exception as exc:  # noqa: BLE001
             logger.error(
@@ -183,6 +215,7 @@ class ProjectSyncWorkflow:
         self._mapping[key] = {
             "kanboard_project_id": project_id,
             "kanboard_project_name": project_name,
+            "repo_slug": slug,
             "gitea_repo_url": clone_url,
             "local_repo_path": local_path,
             "webhook_created": webhook_created,

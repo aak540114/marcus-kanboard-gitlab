@@ -20,6 +20,7 @@ def mock_dev_env():
     """Mock DevEnvironmentManager exposing an async refresh()."""
     mgr = MagicMock()
     mgr.refresh = AsyncMock(return_value=True)
+    mgr.refresh_by_branch = AsyncMock(return_value=True)
     return mgr
 
 
@@ -73,14 +74,14 @@ class TestSignatureValidation:
         body = _push_body("ticket/kanboard/42")
         result = await secured_receiver.handle_request(body, signature=None)
         assert result is False
-        mock_dev_env.refresh.assert_not_called()
+        mock_dev_env.refresh_by_branch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_wrong_signature_rejected(self, secured_receiver, mock_dev_env):
         body = _push_body("ticket/kanboard/42")
         result = await secured_receiver.handle_request(body, signature="deadbeef")
         assert result is False
-        mock_dev_env.refresh.assert_not_called()
+        mock_dev_env.refresh_by_branch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_signature_computed_over_wrong_body_rejected(self, secured_receiver):
@@ -111,7 +112,7 @@ class TestMalformedPayload:
     async def test_invalid_json_rejected(self, receiver, mock_dev_env):
         result = await receiver.handle_request(b"NOT JSON {{{")
         assert result is False
-        mock_dev_env.refresh.assert_not_called()
+        mock_dev_env.refresh_by_branch.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +126,14 @@ class TestRefreshTriggering:
         body = _push_body("ticket/kanboard/42")
         result = await receiver.handle_request(body)
         assert result is True
-        mock_dev_env.refresh.assert_awaited_once_with("42", "kanboard")
+        # Matched by FULL branch name, not by a re-parsed ticket id: the
+        # branch's id segment is sanitized+lowercased at branch-creation
+        # time, so parsing it back can NEVER equal the registry's raw
+        # ticket id for non-lowercase ids (jira PROJ-42 → proj-42) — the
+        # refresh silently missed forever for such providers.
+        mock_dev_env.refresh_by_branch.assert_awaited_once_with(
+            "ticket/kanboard/42"
+        )
 
     @pytest.mark.asyncio
     async def test_ticket_id_with_slashes_preserved(self, receiver, mock_dev_env):
@@ -133,14 +141,16 @@ class TestRefreshTriggering:
         first two slash-delimited components are provider/ticket_id."""
         body = _push_body("ticket/github/org-repo-42")
         await receiver.handle_request(body)
-        mock_dev_env.refresh.assert_awaited_once_with("org-repo-42", "github")
+        mock_dev_env.refresh_by_branch.assert_awaited_once_with(
+            "ticket/github/org-repo-42"
+        )
 
     @pytest.mark.asyncio
     async def test_non_ticket_branch_ignored(self, receiver, mock_dev_env):
         body = _push_body("main")
         result = await receiver.handle_request(body)
         assert result is True
-        mock_dev_env.refresh.assert_not_called()
+        mock_dev_env.refresh_by_branch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_tag_push_ignored(self, receiver, mock_dev_env):
@@ -149,7 +159,7 @@ class TestRefreshTriggering:
         ).encode()
         result = await receiver.handle_request(body)
         assert result is True
-        mock_dev_env.refresh.assert_not_called()
+        mock_dev_env.refresh_by_branch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_returns_true_when_no_env_running_for_ticket(
@@ -157,14 +167,16 @@ class TestRefreshTriggering:
     ):
         """A well-formed ticket-branch push with nothing to refresh is
         still a successfully processed delivery, not an error."""
-        mock_dev_env.refresh = AsyncMock(return_value=False)
+        mock_dev_env.refresh_by_branch = AsyncMock(return_value=False)
         body = _push_body("ticket/kanboard/99")
         result = await receiver.handle_request(body)
         assert result is True
 
     @pytest.mark.asyncio
     async def test_refresh_exception_returns_false(self, receiver, mock_dev_env):
-        mock_dev_env.refresh = AsyncMock(side_effect=RuntimeError("docker exec failed"))
+        mock_dev_env.refresh_by_branch = AsyncMock(
+            side_effect=RuntimeError("docker exec failed")
+        )
         body = _push_body("ticket/kanboard/42")
         result = await receiver.handle_request(body)
         assert result is False
@@ -174,4 +186,6 @@ class TestRefreshTriggering:
         body = json.dumps({"ref": "refs/heads/ticket/kanboard/1"}).encode()
         result = await receiver.handle_request(body)
         assert result is True
-        mock_dev_env.refresh.assert_awaited_once_with("1", "kanboard")
+        mock_dev_env.refresh_by_branch.assert_awaited_once_with(
+            "ticket/kanboard/1"
+        )

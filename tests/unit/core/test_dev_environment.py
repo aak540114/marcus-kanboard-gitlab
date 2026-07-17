@@ -992,3 +992,57 @@ class TestPruneIfDead:
     async def test_unregistered_ticket_is_noop(self, docker_manager):
         """No env registered → nothing to prune."""
         assert await docker_manager.prune_if_dead("T-9", "kanboard") is False
+
+
+class TestRefreshByBranch:
+    """refresh_by_branch matches an env by its exact branch name.
+
+    The Gitea push webhook only knows the branch name — and the branch's
+    ticket-id segment is sanitized and lowercased at branch-creation
+    time, so parsing it back can never equal the registry's raw ticket
+    id for non-lowercase ids (jira PROJ-42 → branch ticket/jira/proj-42
+    → parsed "proj-42" ≠ key "jira:PROJ-42"). Matching by the stored
+    branch name is exact by construction.
+    """
+
+    @pytest.fixture
+    def docker_manager(self, tmp_path):
+        from src.core.dev_environment import DevEnvironmentConfig
+
+        return DevEnvironmentManager(
+            config=DevEnvironmentConfig(repo_path=str(tmp_path), use_docker=True)
+        )
+
+    def _register(self, manager, tid, provider, branch):
+        from src.core.dev_environment import DevEnvironmentInfo
+
+        manager._envs[f"{provider}:{tid}"] = DevEnvironmentInfo(
+            ticket_id=tid,
+            provider=provider,
+            branch_name=branch,
+            port=19660,
+            container_name=f"marcus-dev-{provider}-x",
+            url="http://localhost:19660",
+        )
+
+    @pytest.mark.asyncio
+    async def test_matches_uppercase_ticket_id_env(self, docker_manager):
+        """PROJ-42 env is found via its lowercased branch name."""
+        self._register(docker_manager, "PROJ-42", "jira", "ticket/jira/proj-42")
+        docker_manager.refresh = AsyncMock(return_value=True)
+
+        result = await docker_manager.refresh_by_branch("ticket/jira/proj-42")
+
+        assert result is True
+        docker_manager.refresh.assert_awaited_once_with("PROJ-42", "jira")
+
+    @pytest.mark.asyncio
+    async def test_no_matching_branch_returns_false(self, docker_manager):
+        """No env for this branch → False, refresh never called."""
+        self._register(docker_manager, "1", "kanboard", "ticket/kanboard/1")
+        docker_manager.refresh = AsyncMock()
+
+        result = await docker_manager.refresh_by_branch("ticket/kanboard/2")
+
+        assert result is False
+        docker_manager.refresh.assert_not_called()

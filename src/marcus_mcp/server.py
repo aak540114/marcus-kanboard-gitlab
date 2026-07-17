@@ -3268,7 +3268,14 @@ def _resolve_ticket_branch(server: "MarcusServer", ticket_id: str, provider: str
     str
         The branch name to use.
     """
-    branch = f"ticket/{provider}/{ticket_id}"
+    # Fallback goes through the SAME sanitizer that creates branches —
+    # a raw f-string here produced ticket/jira/PROJ-42 for a ticket whose
+    # real branch is ticket/jira/proj-42 (branch names are sanitized and
+    # lowercased at creation), so the dev container's checkout targeted a
+    # branch that does not exist.
+    from src.core.git_branch_manager import BranchManager
+
+    branch = BranchManager.make_branch_name(provider, ticket_id)
     human_gated_workflow = getattr(server, "_human_gated_workflow", None)
     lifecycle = getattr(human_gated_workflow, "_lifecycle", None)
     if lifecycle is not None:

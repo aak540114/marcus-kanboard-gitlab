@@ -113,30 +113,32 @@ class GiteaWebhookReceiver:
                 branch_name,
             )
             return True
-        provider, ticket_id = ticket_match.group(1), ticket_match.group(2)
 
+        # Match by the FULL branch name, not a re-parsed ticket id: the
+        # branch's id segment was sanitized+lowercased at branch-creation
+        # time, so parsing it back can never equal the registry's raw
+        # ticket id for non-lowercase/special-char ids (jira PROJ-42 →
+        # proj-42) — refresh() by parsed id silently missed forever for
+        # such providers. The env's stored branch name is exact.
         try:
-            refreshed = await self._dev_env.refresh(ticket_id, provider)
+            refreshed = await self._dev_env.refresh_by_branch(branch_name)
         except Exception:
             logger.exception(
-                "Error refreshing dev environment for ticket=%s provider=%s",
-                ticket_id,
-                provider,
+                "Error refreshing dev environment for branch=%s",
+                branch_name,
             )
             return False
 
         if refreshed:
             logger.info(
-                "Gitea webhook -> refreshed dev env (repo=%s, ticket=%s, provider=%s)",
+                "Gitea webhook -> refreshed dev env (repo=%s, branch=%s)",
                 repo_name,
-                ticket_id,
-                provider,
+                branch_name,
             )
         else:
             logger.debug(
-                "Gitea webhook: no running dev env for ticket=%s provider=%s (repo=%s)",
-                ticket_id,
-                provider,
+                "Gitea webhook: no running dev env for branch=%s (repo=%s)",
+                branch_name,
                 repo_name,
             )
         return True

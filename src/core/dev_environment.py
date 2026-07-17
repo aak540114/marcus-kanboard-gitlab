@@ -678,6 +678,41 @@ class DevEnvironmentManager:
             provider, ticket_id = key.split(":", 1)
             await self.stop(ticket_id, provider)
 
+    async def refresh_by_branch(self, branch_name: str) -> bool:
+        """Refresh the environment whose branch matches ``branch_name``.
+
+        Used by the Gitea push webhook, which only knows the branch. The
+        branch's ticket-id segment is sanitized and lowercased at
+        branch-creation time, so parsing an id back OUT of the branch can
+        never equal the registry's raw ticket id for non-lowercase or
+        special-character ids (jira ``PROJ-42`` → branch
+        ``ticket/jira/proj-42`` → parsed ``proj-42`` ≠ key
+        ``jira:PROJ-42``) — the refresh silently missed forever for such
+        providers. Matching against each env's *stored* branch name is
+        exact by construction.
+
+        Parameters
+        ----------
+        branch_name : str
+            Full branch name from the push ref (e.g.
+            ``ticket/kanboard/42``).
+
+        Returns
+        -------
+        bool
+            Result of :meth:`refresh` for the matching env; ``False``
+            when no registered environment uses this branch.
+        """
+        for key, info in self._envs.items():
+            if info.branch_name == branch_name:
+                provider, ticket_id = key.split(":", 1)
+                return await self.refresh(ticket_id, provider)
+        logger.debug(
+            "No dev environment registered for branch %r — nothing to refresh",
+            branch_name,
+        )
+        return False
+
     async def prune_if_dead(self, ticket_id: str, provider: str) -> bool:
         """Purge a registered env whose container has actually died.
 

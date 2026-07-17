@@ -503,8 +503,9 @@ async def get_pending_tickets(
     ----------
     arguments : Dict[str, Any]
         Required:
-            ``state`` — Lifecycle state value (e.g. ``"in_progress"``,
-            ``"revision_requested"``, ``"awaiting_acceptance"``).
+            ``state`` — Lifecycle state value: one of ``"todo"``,
+            ``"ready"``, ``"in_progress"``, ``"waiting_for_human"``,
+            ``"blocked"``, ``"done"``, ``"reopened"``.
         Optional:
             ``provider`` — Filter to a specific provider.
 

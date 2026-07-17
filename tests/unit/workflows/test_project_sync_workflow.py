@@ -59,7 +59,10 @@ class TestOnProjectCreated:
     async def test_creates_repo_and_persists_mapping(self, workflow, gitea_mgr):
         await workflow._on_project_created(_make_event(1, "Shopping Cart", "desc"))
 
-        gitea_mgr.create_repo.assert_called_once_with("Shopping Cart", "desc")
+        # ensure_repo passes the resolved (possibly disambiguated) slug —
+        # create_repo slugifies its argument, so this is equivalent for
+        # the non-colliding case and REQUIRED for the colliding one.
+        gitea_mgr.create_repo.assert_called_once_with("shopping-cart", "desc")
         gitea_mgr.init_with_readme.assert_called_once()
 
         mapping = workflow.get_repo_for_project(1)
@@ -110,7 +113,10 @@ class TestEnsureRepo:
     async def test_creates_repo_and_returns_mapping(self, workflow, gitea_mgr):
         mapping = await workflow.ensure_repo(1, "Shopping Cart", "desc")
 
-        gitea_mgr.create_repo.assert_called_once_with("Shopping Cart", "desc")
+        # ensure_repo passes the resolved (possibly disambiguated) slug —
+        # create_repo slugifies its argument, so this is equivalent for
+        # the non-colliding case and REQUIRED for the colliding one.
+        gitea_mgr.create_repo.assert_called_once_with("shopping-cart", "desc")
         assert mapping is not None
         assert mapping["gitea_repo_url"] == "http://localhost:3000/root/shopping-cart.git"
 
@@ -137,8 +143,61 @@ class TestEnsureRepo:
     async def test_on_project_created_delegates_to_ensure_repo(self, workflow, gitea_mgr):
         await workflow._on_project_created(_make_event(1, "Shopping Cart", "desc"))
 
-        gitea_mgr.create_repo.assert_called_once_with("Shopping Cart", "desc")
+        # ensure_repo passes the resolved (possibly disambiguated) slug —
+        # create_repo slugifies its argument, so this is equivalent for
+        # the non-colliding case and REQUIRED for the colliding one.
+        gitea_mgr.create_repo.assert_called_once_with("shopping-cart", "desc")
         assert workflow.get_repo_for_project(1) is not None
+
+
+class TestSlugDisambiguation:
+    """Slug collisions and empty slugs must not cross-wire projects.
+
+    create_repo() treats "repo already exists" as "already provisioned"
+    and returns the existing repo's URL — so two Kanboard projects whose
+    names slugify identically ("My App" / "my app!") were silently
+    mapped to the SAME Gitea repo and the SAME local clone, merging both
+    projects' tickets into one main. All-symbol names slugified to ""
+    and permanently failed provisioning instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_colliding_slug_gets_project_id_suffix(
+        self, workflow, gitea_mgr
+    ):
+        """Second project with the same slug gets a disambiguated repo."""
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+        await workflow.ensure_repo(1, "My App")
+        await workflow.ensure_repo(2, "my app!")
+
+        second_repo_name = gitea_mgr.create_repo.call_args_list[1].args[0]
+        assert second_repo_name == "my-app-p2"
+        first = workflow.get_repo_for_project(1)
+        second = workflow.get_repo_for_project(2)
+        assert first["local_repo_path"] != second["local_repo_path"]
+
+    @pytest.mark.asyncio
+    async def test_same_project_reensure_is_not_disambiguated(
+        self, workflow, gitea_mgr
+    ):
+        """Re-ensuring the SAME project hits the cache, no new repo."""
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+        await workflow.ensure_repo(1, "My App")
+        await workflow.ensure_repo(1, "My App")
+        assert gitea_mgr.create_repo.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_slug_falls_back_to_project_id(
+        self, workflow, gitea_mgr
+    ):
+        """An all-symbol name provisions under project-<id>, not ""."""
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+        mapping = await workflow.ensure_repo(7, "Проект!!!")
+
+        repo_name = gitea_mgr.create_repo.call_args.args[0]
+        assert repo_name == "project-7"
+        assert mapping is not None
+        assert mapping["local_repo_path"].endswith("project-7")
 
 
 class TestEnsureWebhook:
