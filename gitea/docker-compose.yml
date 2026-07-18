@@ -42,7 +42,7 @@
 #        --email root@example.com --admin --must-change-password=false
 # 2. Visit $GITEA_EXTERNAL_URL — log in as root
 # 3. Settings → Applications → Generate New Token — scopes:
-#      write:repository  read:user
+#      write:repository  write:user
 #    Copy the token; set it on Marcus:
 #      export GITEA_TOKEN=<token>
 #      export GITEA_URL=<GITEA_EXTERNAL_URL>

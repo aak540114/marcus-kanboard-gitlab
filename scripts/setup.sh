@@ -494,7 +494,7 @@ if [ "$token_valid" = "false" ]; then
     token_name="marcus-$(date +%s)"
     gitea_token="$(docker compose exec -T -u git gitea gitea admin user generate-access-token \
         --username root --token-name "$token_name" \
-        --scopes write:repository,read:user --raw | tr -d '\r\n')"
+        --scopes write:repository,write:user --raw | tr -d '\r\n')"
     env_set GITEA_TOKEN "$gitea_token"
     log "Gitea token generated."
 else

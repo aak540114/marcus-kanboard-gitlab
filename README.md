@@ -158,7 +158,7 @@ docker compose exec -u git gitea gitea admin user create \
   --username root --password Marcus123! \
   --email root@example.com --admin --must-change-password=false
 ```
-Then log in at http://localhost:3000 as `root` / `Marcus123!` → **Settings → Applications → Generate New Token** (scopes `write:repository`, `read:user`).
+Then log in at http://localhost:3000 as `root` / `Marcus123!` → **Settings → Applications → Generate New Token** (scopes `write:repository`, `write:user`).
 
 **Configure and start Marcus** — put the values you just collected into `.env` (see `.env.example`). You **must** set `MARCUS_AI_PROVIDER` explicitly on this manual path — `.env.example` ships it blank and Docker Compose defaults an unset value to `claude_subscription`, so if you meant to use an API key, set `MARCUS_AI_PROVIDER=anthropic` (and `CLAUDE_API_KEY=...`) — see [AI provider](#ai-provider).
 
