@@ -2098,6 +2098,62 @@ class TestMultiAgentParallelism:
         assert lifecycle.get("10", "kanboard").ai_agent_id == wf._agent_id
 
     @pytest.mark.asyncio
+    async def test_unassign_frees_slot_and_picks_up_waiting_ticket(
+        self, make_workflow, lifecycle, mock_kanban
+    ):
+        """Unassigning a busy ticket frees its slot for a waiting ticket.
+
+        Under the parallel-agent cap, freeing capacity must immediately let
+        waiting assigned work start — not sit idle until some unrelated
+        completion event happens to trigger pickup.
+        """
+        wf = make_workflow(1)
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            # The single slot is busy on ticket 10.
+            await wf._start_ai_work("10", self._ready_assigned(lifecycle, "10"))
+            # Ticket 11 is ready + assigned, waiting for a free slot.
+            self._ready_assigned(lifecycle, "11")
+
+            # Human unassigns ticket 10 → its slot frees.
+            event = _make_event(
+                {"ticket_id": "10", "provider": "kanboard"}
+            )
+            await wf._on_ticket_unassigned(event)
+
+        # Ticket 10 released; ticket 11 picked up into the freed slot.
+        assert lifecycle.get("10", "kanboard").ai_agent_id is None
+        rec11 = lifecycle.get("11", "kanboard")
+        assert rec11.ai_agent_id is not None
+        assert rec11.state == TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_todo_reset_frees_slot_and_picks_up_waiting_ticket(
+        self, make_workflow, lifecycle, mock_kanban
+    ):
+        """Resetting a busy ticket to todo frees its slot for waiting work."""
+        wf = make_workflow(1)
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            await wf._start_ai_work("10", self._ready_assigned(lifecycle, "10"))
+            self._ready_assigned(lifecycle, "11")
+
+            # Human drags ticket 10 back to the todo column.
+            event = _make_event(
+                {"ticket_id": "10", "new_status": "todo", "provider": "kanboard"}
+            )
+            await wf._on_status_changed(event)
+
+        assert lifecycle.get("10", "kanboard").ai_agent_id is None
+        rec11 = lifecycle.get("11", "kanboard")
+        assert rec11.ai_agent_id is not None
+        assert rec11.state == TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
     async def test_invalid_count_coerced_to_one(
         self, lifecycle, mock_kanban, mock_branch, mock_dev_env, mock_ac_gen
     ):

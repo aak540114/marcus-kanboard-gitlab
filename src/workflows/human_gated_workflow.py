@@ -342,6 +342,10 @@ class HumanGatedWorkflow:
         except KeyError:
             pass
 
+        # Unassigning freed a slot; fill it with any waiting assigned work
+        # so parallel capacity is not left idle until an unrelated event.
+        await self._pickup_next_ticket()
+
     async def _on_status_changed(self, event: Any) -> None:
         """Handle a kanban status/column change.
 
@@ -454,6 +458,8 @@ class HumanGatedWorkflow:
                 self._lifecycle.release_ticket(ticket_id, self._provider)
             except KeyError:
                 pass
+            # The todo reset freed a slot; fill it with waiting assigned work.
+            await self._pickup_next_ticket()
 
         elif new_status == TaskStatus.BLOCKED.value:
             # Human marked the ticket blocked.
@@ -1756,11 +1762,12 @@ class HumanGatedWorkflow:
     async def _pickup_next_ticket(self) -> None:
         """Fill every free agent slot with the next available tickets.
 
-        Called whenever a ticket moves to ``WAITING_FOR_HUMAN``,
-        ``BLOCKED``, or ``DONE`` (freeing a slot), and at startup, so idle
-        slots do not sit unused while assigned work is ready. Starts work on
-        as many available tickets as there are free slots — up to the
-        parallel-agent cap — and leaves the rest to wait.
+        Called whenever a ticket frees a slot — it moved to
+        ``WAITING_FOR_HUMAN``, ``BLOCKED``, or ``DONE``, or a human
+        unassigned it or reset it to ``TODO`` — so idle slots do not sit
+        unused while assigned work is ready. Starts work on as many
+        available tickets as there are free slots — up to the parallel-agent
+        cap — and leaves the rest to wait.
 
         Selection order (dependency approximation):
 
@@ -1778,9 +1785,8 @@ class HumanGatedWorkflow:
             # Stop as soon as we are at capacity — remaining tickets wait.
             if self._free_slot_id() is None:
                 logger.debug(
-                    "All %d agent slot(s) busy; %d ticket(s) still waiting",
+                    "All %d agent slot(s) busy; remaining available tickets wait",
                     self._max_parallel_agents,
-                    len(candidates) - len(self._busy_ticket_ids()),
                 )
                 break
             logger.info(
