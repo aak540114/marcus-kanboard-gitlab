@@ -582,3 +582,63 @@ class TestAcGeneratorWiredToLLM:
             await _wire_human_gated_workflow(server)
 
         assert wf_cls.call_args.kwargs["ac_generator"] is None
+
+
+class TestProjectWatcherAutoRepo:
+    """Every Kanboard project should get a Gitea repo automatically.
+
+    ProjectWatcher polls getAllProjects and emits project.created for any
+    project it hasn't seen; ProjectSyncWorkflow._on_project_created turns
+    that into ensure_repo (idempotent). The watcher was built but never
+    started — so repos were only ever created on-demand when an agent
+    first worked a ticket. Starting it means existing projects missing a
+    repo get one on the first poll (empty known-set → emits for all).
+    """
+
+    @pytest.mark.asyncio
+    async def test_watcher_started_when_gitea_and_kanboard_configured(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("GITEA_URL", "http://gitea:3000")
+        monkeypatch.setenv("GITEA_TOKEN", "tok123")
+        monkeypatch.setenv("KANBOARD_URL", "http://kanboard/jsonrpc.php")
+        monkeypatch.setenv("KANBOARD_API_TOKEN", "kbtok")
+        server = _make_server()
+
+        mock_gitea = AsyncMock()
+        mock_gitea.connect = AsyncMock(return_value=True)
+        mock_watcher = AsyncMock()
+
+        with (
+            patch("src.integrations.gitea_manager.GiteaManager", return_value=mock_gitea),
+            patch("src.workflows.project_sync_workflow.ProjectSyncWorkflow"),
+            patch("src.workflows.human_gated_workflow.HumanGatedWorkflow", return_value=AsyncMock()),
+            patch("src.marcus_mcp.tools.human_gated.register_workflow"),
+            patch(
+                "src.core.project_watcher.ProjectWatcher", return_value=mock_watcher
+            ) as watcher_cls,
+        ):
+            await _wire_human_gated_workflow(server)
+
+        watcher_cls.assert_called_once()
+        kwargs = watcher_cls.call_args.kwargs
+        assert kwargs["kanboard_url"] == "http://kanboard/jsonrpc.php"
+        assert kwargs["api_token"] == "kbtok"
+        mock_watcher.start.assert_awaited_once()
+        assert server._project_watcher is mock_watcher
+
+    @pytest.mark.asyncio
+    async def test_no_watcher_without_gitea(self, monkeypatch):
+        """No Gitea → no repo target → no watcher started."""
+        monkeypatch.delenv("GITEA_URL", raising=False)
+        server = _make_server()
+
+        with (
+            patch("src.workflows.human_gated_workflow.HumanGatedWorkflow", return_value=AsyncMock()),
+            patch("src.marcus_mcp.tools.human_gated.register_workflow"),
+            patch("src.core.project_watcher.ProjectWatcher") as watcher_cls,
+        ):
+            await _wire_human_gated_workflow(server)
+
+        watcher_cls.assert_not_called()
+        assert not hasattr(server, "_project_watcher")

@@ -3456,6 +3456,38 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
             )
             project_sync.subscribe()
             server._gitea_manager = gitea_mgr  # type: ignore[attr-defined]
+
+            # Auto-create a Gitea repo for EVERY Kanboard project, not just
+            # on-demand when an agent first works a ticket. ProjectWatcher
+            # polls Kanboard's getAllProjects and emits project.created for
+            # any project it hasn't seen — which project_sync.subscribe()
+            # above turns into ensure_repo (idempotent). On the first poll
+            # its known-set is empty, so it emits for every EXISTING
+            # project too, giving each one a repo. Previously this watcher
+            # was never started, so repos only ever appeared lazily and a
+            # project no agent had touched had none.
+            kb_url = os.environ.get("KANBOARD_URL")
+            kb_token = os.environ.get("KANBOARD_API_TOKEN")
+            if kb_url and kb_token:
+                from src.core.project_watcher import ProjectWatcher
+
+                watcher = ProjectWatcher(
+                    kanboard_url=kb_url,
+                    api_token=kb_token,
+                    events=server.events,
+                    state_path="./data/known_projects.json",
+                )
+                await watcher.start()
+                server._project_watcher = watcher  # type: ignore[attr-defined]
+                logger.info(
+                    "ProjectWatcher started — Kanboard projects will "
+                    "auto-provision Gitea repos"
+                )
+            else:
+                logger.warning(
+                    "KANBOARD_URL/KANBOARD_API_TOKEN not set — project→repo "
+                    "auto-creation disabled (repos still created on-demand)"
+                )
         else:
             logger.warning(
                 "GiteaManager could not connect to %s — dev-environment "
@@ -4431,6 +4463,9 @@ function save() {{
                     )
                     if human_gated_workflow is not None:
                         await human_gated_workflow.stop()
+                    project_watcher = getattr(server, "_project_watcher", None)
+                    if project_watcher is not None:
+                        await project_watcher.stop()
 
         app = Starlette(
             routes=[
