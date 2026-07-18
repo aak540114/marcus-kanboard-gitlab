@@ -248,10 +248,20 @@ class ProjectWatcher:
             return set()
 
     def _save_known_ids(self) -> None:
-        """Persist known project IDs to disk."""
+        """Persist known project IDs to disk atomically.
+
+        Writes to a temp file and ``os.replace``s it into place so a crash
+        or OOM-kill mid-write can never leave a truncated file. A truncated
+        file parses as empty on the next load, which — in the legacy
+        (no-``is_provisioned``) path — makes the watcher re-emit
+        ``project.created`` for every project on the board, re-triggering all
+        subscribers (repo creation, column reconciliation).
+        """
         os.makedirs(os.path.dirname(self._state_path) or ".", exist_ok=True)
+        tmp = self._state_path + ".tmp"
         try:
-            with open(self._state_path, "w") as f:
+            with open(tmp, "w") as f:
                 json.dump({"known_ids": sorted(self._known_ids)}, f)
+            os.replace(tmp, self._state_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not save project watcher state: %s", exc)

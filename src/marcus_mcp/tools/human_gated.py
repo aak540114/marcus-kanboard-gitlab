@@ -73,6 +73,30 @@ def _lifecycle() -> Optional[Any]:
     return getattr(wf, "_lifecycle", None) if wf else None
 
 
+def _effective_provider(caller_provider: str) -> str:
+    """Return the provider records are actually keyed under.
+
+    The workflow always stores lifecycle records and dev environments under
+    its OWN configured provider (``wf._provider``), and the write tools
+    already ignore the caller-supplied ``provider`` for that reason. The read
+    tools must use the same key or they report ``not_tracked`` /
+    ``running: false`` for tickets that are actually live. Falls back to the
+    caller's value only when no workflow is registered.
+
+    Parameters
+    ----------
+    caller_provider : str
+        The ``provider`` argument the agent passed.
+
+    Returns
+    -------
+    str
+        The workflow's provider if available, else *caller_provider*.
+    """
+    wf = _WORKFLOW_INSTANCE
+    return getattr(wf, "_provider", caller_provider) if wf else caller_provider
+
+
 async def generate_acceptance_criteria(
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -160,11 +184,23 @@ async def post_ticket_progress(
     """
     ticket_id = arguments.get("ticket_id", "")
     provider = arguments.get("provider", "")
-    percentage = int(arguments.get("percentage", 0))
     message = arguments.get("message", "Work in progress.")
 
     if not ticket_id or not provider:
         return {"success": False, "error": "ticket_id and provider are required"}
+
+    # Coerce + clamp defensively: agents pass "50%", "about half", or null.
+    # Doing this outside the try (as before) let a ValueError escape into the
+    # generic handler, breaking the {success, result|error} contract; a
+    # missing clamp let "250" reach the human-facing ticket verbatim.
+    try:
+        percentage = int(arguments.get("percentage", 0))
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "error": "percentage must be an integer between 0 and 100",
+        }
+    percentage = max(0, min(100, percentage))
 
     wf = _workflow()
     if wf is None:
@@ -173,7 +209,7 @@ async def post_ticket_progress(
     try:
         posted = await wf.report_progress(ticket_id, percentage, message)
         return {
-            "success": True,
+            "success": bool(posted),
             "result": {
                 "comment_posted": posted,
                 "ticket_id": ticket_id,
@@ -219,17 +255,22 @@ async def signal_ready_for_review(
         return {"success": False, "error": "HumanGatedWorkflow not initialised"}
 
     try:
-        posted = await wf.signal_ready_for_review(ticket_id)
+        # `ok` reflects whether the transition actually happened. Reporting a
+        # hardcoded success:True hid real failures (Kanboard outage, or a
+        # duplicate call on an already-reviewed ticket) from the agent, which
+        # then never retried and left the ticket stuck IN_PROGRESS.
+        ok = await wf.signal_ready_for_review(ticket_id)
+        prov = _effective_provider(provider)
         lm = _lifecycle()
         state = (
-            lm.get(ticket_id, provider).state.value
-            if lm and lm.get(ticket_id, provider)
+            lm.get(ticket_id, prov).state.value
+            if lm and lm.get(ticket_id, prov)
             else "unknown"
         )
         return {
-            "success": True,
+            "success": bool(ok),
             "result": {
-                "comment_posted": posted,
+                "comment_posted": ok,
                 "new_state": state,
                 "ticket_id": ticket_id,
             },
@@ -275,13 +316,19 @@ async def signal_waiting_for_human(
         return {"success": False, "error": "HumanGatedWorkflow not initialised"}
 
     try:
-        posted = await wf.set_waiting_for_human(ticket_id, reason=reason)
+        # set_waiting_for_human returns False when the ticket is not
+        # IN_PROGRESS (or the comment post failed). Propagate that instead of
+        # claiming success and a "waiting_for_human" state that never happened.
+        ok = await wf.set_waiting_for_human(ticket_id, reason=reason)
+        prov = _effective_provider(provider)
+        lm = _lifecycle()
+        rec = lm.get(ticket_id, prov) if lm else None
         return {
-            "success": True,
+            "success": bool(ok),
             "result": {
-                "comment_posted": posted,
+                "comment_posted": ok,
                 "ticket_id": ticket_id,
-                "new_state": "waiting_for_human",
+                "new_state": rec.state.value if rec else "unknown",
             },
         }
     except Exception as exc:  # noqa: BLE001
@@ -353,7 +400,8 @@ async def get_ticket_lifecycle_state(
     -------
     Dict[str, Any]
         ``{success, result: {state, branch_name, assignee, ac_hash,
-        dev_env_port, merged_at, history}}`` or ``{success: False, error}``.
+        dev_env_port, merged_at, created_at, updated_at, history_count,
+        last_transition}}`` or ``{success: False, error}``.
     """
     ticket_id = arguments.get("ticket_id", "")
     provider = arguments.get("provider", "")
@@ -365,7 +413,7 @@ async def get_ticket_lifecycle_state(
     if lm is None:
         return {"success": False, "error": "TicketLifecycleManager not available"}
 
-    record = lm.get(ticket_id, provider)
+    record = lm.get(ticket_id, _effective_provider(provider))
     if record is None:
         return {
             "success": True,
@@ -479,7 +527,11 @@ async def get_ticket_dev_environment_url(
     if wf is None:
         return {"success": False, "error": "HumanGatedWorkflow not initialised"}
 
-    dev_info = wf._dev_env.get_info(ticket_id, provider)
+    # Environments are registered under the workflow's own provider, so look
+    # them up the same way start_ticket_dev_environment stores them — else a
+    # live environment reads back as running: false.
+    prov = _effective_provider(provider)
+    dev_info = wf._dev_env.get_info(ticket_id, prov)
     return {
         "success": True,
         "result": {
@@ -487,7 +539,7 @@ async def get_ticket_dev_environment_url(
             "url": dev_info.url if dev_info else None,
             "port": dev_info.port if dev_info else None,
             "ticket_id": ticket_id,
-            "provider": provider,
+            "provider": prov,
         },
     }
 

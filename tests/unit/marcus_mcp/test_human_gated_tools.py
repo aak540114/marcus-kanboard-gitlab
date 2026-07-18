@@ -14,7 +14,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.marcus_mcp.tools.human_gated import (
+    post_ticket_progress,
     register_workflow,
+    signal_ready_for_review,
+    signal_waiting_for_human,
     start_ticket_dev_environment,
 )
 
@@ -121,3 +124,78 @@ class TestStartTicketDevEnvironment:
 
         assert result["success"] is True
         assert result["result"]["port"] is None
+
+
+class TestSignalToolsPropagateFailure:
+    """Signal tools must report the workflow's real success/failure."""
+
+    @pytest.mark.asyncio
+    async def test_signal_ready_reports_false_when_workflow_returns_false(self):
+        """A rejected/duplicate signal_ready_for_review → success: False."""
+        wf = MagicMock()
+        wf._provider = "kanboard"
+        wf.signal_ready_for_review = AsyncMock(return_value=False)
+        wf._lifecycle = MagicMock()
+        wf._lifecycle.get = MagicMock(return_value=None)
+        register_workflow(wf)
+
+        result = await signal_ready_for_review(
+            {"ticket_id": "42", "provider": "kanboard"}
+        )
+
+        assert result["success"] is False
+        assert result["result"]["comment_posted"] is False
+
+    @pytest.mark.asyncio
+    async def test_signal_waiting_reports_false_when_not_in_progress(self):
+        """set_waiting_for_human returning False → success: False, real state."""
+        wf = MagicMock()
+        wf._provider = "kanboard"
+        wf.set_waiting_for_human = AsyncMock(return_value=False)
+        rec = MagicMock()
+        rec.state = MagicMock(value="in_progress")
+        wf._lifecycle = MagicMock()
+        wf._lifecycle.get = MagicMock(return_value=rec)
+        register_workflow(wf)
+
+        result = await signal_waiting_for_human(
+            {"ticket_id": "42", "provider": "kanboard"}
+        )
+
+        assert result["success"] is False
+        # Reports the REAL state, not a hardcoded "waiting_for_human".
+        assert result["result"]["new_state"] == "in_progress"
+
+
+class TestPostProgressPercentage:
+    """post_ticket_progress must coerce/clamp percentage safely."""
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_percentage_returns_clean_error(self):
+        wf = MagicMock()
+        wf._provider = "kanboard"
+        wf.report_progress = AsyncMock(return_value=True)
+        register_workflow(wf)
+
+        result = await post_ticket_progress(
+            {"ticket_id": "42", "provider": "kanboard", "percentage": "about half"}
+        )
+
+        assert result["success"] is False
+        assert "percentage" in result["error"]
+        wf.report_progress.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_out_of_range_percentage_is_clamped(self):
+        wf = MagicMock()
+        wf._provider = "kanboard"
+        wf.report_progress = AsyncMock(return_value=True)
+        register_workflow(wf)
+
+        result = await post_ticket_progress(
+            {"ticket_id": "42", "provider": "kanboard", "percentage": 250}
+        )
+
+        assert result["success"] is True
+        assert result["result"]["percentage"] == 100
+        wf.report_progress.assert_awaited_once_with("42", 100, "Work in progress.")

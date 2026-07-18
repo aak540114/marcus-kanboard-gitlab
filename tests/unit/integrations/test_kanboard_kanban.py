@@ -1160,6 +1160,51 @@ class TestEnsureColumns:
         assert "removeColumn" not in methods
 
     @pytest.mark.asyncio
+    async def test_refreshes_column_cache_for_configured_project(self, kanban):
+        """Reconciling the CONFIGURED project rebuilds the column cache.
+
+        Otherwise moves to newly-added Blocked/Waiting-for-Human columns
+        fail with 'column not found' until the process restarts.
+        """
+        kanban._client = AsyncMock()
+        kanban._project_id = 7  # make the reconciled project the configured one
+        kanban._column_map = {}  # simulate a stale/empty connect()-time cache
+        marcus_cols = [
+            {"id": i + 1, "title": t, "position": i + 1}
+            for i, t in enumerate(
+                ["Todo", "Ready", "In Progress", "Blocked", "Waiting for Human", "Done"]
+            )
+        ]
+
+        async def fake_rpc(method, **params):
+            return marcus_cols if method == "getColumns" else True
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        await kanban.ensure_columns(7)
+
+        # Cache now resolves the gate columns the workflow moves cards to.
+        assert "blocked" in kanban._column_map
+        assert "waiting for human" in kanban._column_map
+        assert "in progress" in kanban._column_map
+
+    @pytest.mark.asyncio
+    async def test_does_not_refresh_cache_for_other_project(self, kanban):
+        """Reconciling a NON-configured project leaves this client's cache."""
+        kanban._client = AsyncMock()
+        kanban._project_id = 1
+        kanban._column_map = {"sentinel": 99}
+
+        async def fake_rpc(method, **params):
+            return [] if method == "getColumns" else True
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        await kanban.ensure_columns(7)  # different project
+
+        assert kanban._column_map == {"sentinel": 99}
+
+    @pytest.mark.asyncio
     async def test_raises_if_not_connected(self, kanban):
         with pytest.raises(RuntimeError, match="connect()"):
             await kanban.ensure_columns(7)

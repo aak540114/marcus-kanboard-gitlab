@@ -49,6 +49,7 @@ HumanGatedWorkflow
 """
 
 import logging
+import os
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, cast
 
@@ -481,6 +482,35 @@ class HumanGatedWorkflow:
         if record is None:
             return
 
+        # Human closed a ticket that AI never actually started (no branch to
+        # merge). Under the parallel-agent cap an assigned ticket can sit in
+        # READY (or TODO) waiting for a free slot; if the human then drags it
+        # to Done, it must be marked DONE and released — otherwise it stays
+        # READY+assigned+unclaimed, i.e. still "available", and the next slot
+        # to free re-picks it, dragging the card back out of Done and posting
+        # a "Started" comment (AI resurrects a ticket the human closed).
+        if record.state in (TicketState.READY, TicketState.TODO):
+            try:
+                self._lifecycle.human_transition(
+                    ticket_id,
+                    self._provider,
+                    TicketState.DONE,
+                    reason="Human closed ticket before AI work began",
+                )
+            except (InvalidTransitionError, KeyError):
+                pass
+            try:
+                self._lifecycle.release_ticket(ticket_id, self._provider)
+            except KeyError:
+                pass
+            logger.info(
+                "Ticket %s closed by human before any AI work — marked DONE",
+                ticket_id,
+            )
+            await self._resume_tickets_blocked_by(ticket_id)
+            await self._pickup_next_ticket()
+            return
+
         if record.state not in (
             TicketState.IN_PROGRESS,
             TicketState.WAITING_FOR_HUMAN,
@@ -557,6 +587,26 @@ class HumanGatedWorkflow:
                 f"Merge of `{branch_name}` to `{main_branch}` failed — "
                 "there may be conflicts.  Please merge manually or rebase the branch.",
             )
+            # Park the ticket in WAITING_FOR_HUMAN and free the slot. The old
+            # behavior left it IN_PROGRESS and *claimed* — permanently leaking
+            # one parallel slot (a full deadlock at cap=1), since no later
+            # event ever released it. Parking removes it from the available
+            # pool (no re-merge loop) and lets a human resolve the conflict.
+            self._park_in_waiting_for_human(
+                ticket_id,
+                reason="Merge to main failed; awaiting human conflict resolution",
+            )
+            try:
+                await self._kanban.move_task_to_column(
+                    ticket_id, "waiting for human"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not move %s to waiting-for-human after merge fail: %s",
+                    ticket_id,
+                    exc,
+                )
+            await self._pickup_next_ticket()
 
     async def _on_ticket_reopened(self, event: Any) -> None:
         """Handle a ticket being reopened — rebase branch on main and resume."""
@@ -784,6 +834,23 @@ class HumanGatedWorkflow:
         """
         record = self._lifecycle.get(ticket_id, self._provider)
         if record is None:
+            return False
+
+        # Only a ticket actively IN_PROGRESS can be signalled ready. Without
+        # this guard a duplicate call (agent retry, or an LLM calling the tool
+        # twice) on an already-WAITING_FOR_HUMAN ticket re-posted the whole
+        # "Ready for Review" comment before failing the illegal WFH→WFH
+        # transition; in AI-gate mode a duplicate re-ran the merge + DONE
+        # sequence on an already-done ticket (duplicate "Merged" comment). A
+        # genuine retry after a *failed* post still works — that path leaves
+        # the ticket IN_PROGRESS.
+        if record.state != TicketState.IN_PROGRESS:
+            logger.info(
+                "signal_ready_for_review on %s ignored: state is %s, not "
+                "in_progress (likely a duplicate call)",
+                ticket_id,
+                record.state.value,
+            )
             return False
 
         gate = await self._get_effective_gate(ticket_id)
@@ -1024,7 +1091,15 @@ class HumanGatedWorkflow:
         closed_ticket_id : str
             The ticket that just completed.
         """
-        matches = self._lifecycle.get_records_blocked_by(closed_ticket_id)
+        # Scope to this workflow's provider: the lifecycle store can be
+        # shared across providers, but _start_ai_work claims under
+        # self._provider, so a foreign-provider record would raise KeyError
+        # (or claim the wrong record) at claim time.
+        matches = [
+            r
+            for r in self._lifecycle.get_records_blocked_by(closed_ticket_id)
+            if r.provider == self._provider
+        ]
         for record in matches:
             blocked_id = record.ticket_id
             logger.info(
@@ -1326,7 +1401,10 @@ class HumanGatedWorkflow:
             "estimated_hours": estimated_hours,
             "links": links,
             "recent_comments": recent_comments,
-            "mcp_server_url": "http://localhost:4298/mcp",
+            # Informational reconnect hint. Hardcoding localhost handed a
+            # REMOTE agent a URL pointing at its own machine; honor MARCUS_URL
+            # (the deployment's public base) when set.
+            "mcp_server_url": self._mcp_server_url(),
             "gate_mode": (
                 self._gate.get_effective_gate(ticket_id, kanboard_project_id)
                 if kanboard_project_id is not None
@@ -1521,6 +1599,49 @@ class HumanGatedWorkflow:
         except KeyError:
             pass
 
+    def _park_in_waiting_for_human(self, ticket_id: str, reason: str) -> None:
+        """Move a ticket to WAITING_FOR_HUMAN and release its claim.
+
+        ``WAITING_FOR_HUMAN`` is only reachable from ``IN_PROGRESS``, so this
+        walks ``TODO → READY → IN_PROGRESS → WAITING_FOR_HUMAN`` as far as the
+        state machine allows. Used to take a ticket out of the *available*
+        pool (``READY``/``IN_PROGRESS``) so it awaits a human without being
+        re-selected by :meth:`_pickup_next_ticket` in a loop — e.g. a missing
+        project description or a merge conflict. Also frees the agent slot.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        reason : str
+            Reason recorded on each transition.
+        """
+        next_state = {
+            TicketState.TODO: TicketState.READY,
+            TicketState.READY: TicketState.IN_PROGRESS,
+            TicketState.IN_PROGRESS: TicketState.WAITING_FOR_HUMAN,
+        }
+        # At most three hops to climb from TODO to WAITING_FOR_HUMAN.
+        for _ in range(len(next_state)):
+            cur = self._lifecycle.get(ticket_id, self._provider)
+            if cur is None or cur.state == TicketState.WAITING_FOR_HUMAN:
+                break
+            target = next_state.get(cur.state)
+            if target is None:
+                # BLOCKED / REOPENED / DONE — not on the WFH path. Leaving the
+                # claim released below is enough; these are not "available".
+                break
+            try:
+                self._lifecycle.transition(
+                    ticket_id, self._provider, target, reason=reason
+                )
+            except InvalidTransitionError:
+                break
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
+
     async def _start_ai_work(
         self,
         ticket_id: str,
@@ -1600,7 +1721,16 @@ class HumanGatedWorkflow:
         # If the stack is unclear, ask the human and stop until they respond.
         stack_ok = await self._check_project_stack(ticket_id)
         if not stack_ok:
-            self._lifecycle.release_ticket(ticket_id, self._provider)
+            # _check_project_stack already posted the "need description"
+            # comment and moved the board card to "waiting for human". Park
+            # the lifecycle record there too (and free the slot). Just
+            # releasing left it READY+assigned+unclaimed — still "available"
+            # — so every later slot-freeing event re-selected it, re-ran the
+            # stack check, and re-posted the same comment (spam on a loop).
+            self._park_in_waiting_for_human(
+                ticket_id,
+                reason="Paused: project description missing tech-stack info",
+            )
             return
 
         # Advance the lifecycle state to IN_PROGRESS via READY if needed.
@@ -1775,7 +1905,14 @@ class HumanGatedWorkflow:
         2. Lower numeric ticket ID first (earlier-created tickets are more
            likely to be prerequisites for later work).
         """
-        candidates = self._lifecycle.get_available_tickets()
+        # Scope to this workflow's provider — get_available_tickets() spans
+        # every provider in a shared store, but _start_ai_work claims under
+        # self._provider (a foreign record would KeyError or mis-claim).
+        candidates = [
+            r
+            for r in self._lifecycle.get_available_tickets()
+            if r.provider == self._provider
+        ]
         if not candidates:
             logger.debug("No next ticket to pick up (no available work)")
             return
@@ -1795,6 +1932,24 @@ class HumanGatedWorkflow:
                 next_rec.state.value,
             )
             await self._start_ai_work(next_rec.ticket_id, next_rec)
+
+    @staticmethod
+    def _mcp_server_url() -> str:
+        """Return the MCP endpoint URL to advertise to agents.
+
+        Prefers ``MARCUS_URL`` (the deployment's public base, set by
+        ``scripts/setup.sh`` for remote access) so a remote agent gets a
+        reachable address; falls back to the localhost default otherwise.
+
+        Returns
+        -------
+        str
+            The ``/mcp`` endpoint URL.
+        """
+        base = (os.environ.get("MARCUS_URL") or "").strip().rstrip("/")
+        if base:
+            return f"{base}/mcp"
+        return "http://localhost:4298/mcp"
 
     def _is_unassigned(self, record: TicketRecord) -> bool:
         """Return ``True`` if no human is assigned to *record*.

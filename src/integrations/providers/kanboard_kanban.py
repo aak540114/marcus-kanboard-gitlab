@@ -548,6 +548,16 @@ class KanboardKanban(KanbanInterface):
                     column_id=int(target["id"]),
                     position=position,
                 )
+
+        # Rebuild the in-memory column cache for THIS project. connect()
+        # populated _column_map/_column_status_map once, before any columns
+        # were added or renamed here — so without this refresh a freshly
+        # reconciled configured project can't resolve the new "Blocked" /
+        # "Waiting for Human" columns, and every gate move to them silently
+        # returns False (column not found) until the process restarts.
+        if pid == self._project_id:
+            await self._refresh_columns()
+
         logger.info("Reconciled columns for Kanboard project %d", pid)
         return True
 

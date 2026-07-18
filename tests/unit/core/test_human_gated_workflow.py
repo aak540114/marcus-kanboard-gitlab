@@ -2176,3 +2176,126 @@ class TestMultiAgentParallelism:
             await wf._start_ai_work("10", self._ready_assigned(lifecycle, "10"))
         # Still works as a single agent.
         assert lifecycle.get("10", "kanboard").ai_agent_id is not None
+
+
+# ---------------------------------------------------------------------------
+# Deep-review fixes: close/merge/stack/duplicate-signal edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestReviewFixes:
+    """Regression tests for bugs found in the multi-agent deep review."""
+
+    def _ready_assigned(self, lifecycle, tid: str, who: str = "alice") -> Any:
+        """Create a READY, human-assigned, unclaimed ticket."""
+        lifecycle.get_or_create(tid, "kanboard")
+        lifecycle.transition(tid, "kanboard", TicketState.READY)
+        lifecycle.set_assignee(tid, "kanboard", who)
+        return lifecycle.get(tid, "kanboard")
+
+    @pytest.mark.asyncio
+    async def test_closing_unstarted_ready_ticket_marks_done_not_resurrected(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Human closing a waiting READY ticket → DONE, never re-picked-up."""
+        self._ready_assigned(lifecycle, "50")
+
+        event = _make_event({"ticket_id": "50", "provider": "kanboard"})
+        await workflow._on_ticket_closed(event)
+
+        rec = lifecycle.get("50", "kanboard")
+        assert rec.state == TicketState.DONE
+        assert rec.ai_agent_id is None
+        # No longer available → a later pickup can never resurrect it.
+        assert "50" not in {r.ticket_id for r in lifecycle.get_available_tickets()}
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            await workflow._pickup_next_ticket()
+        assert lifecycle.get("50", "kanboard").ai_agent_id is None
+
+    @pytest.mark.asyncio
+    async def test_merge_failure_frees_slot_and_parks_waiting(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """A failed merge parks the ticket in WFH and releases the slot.
+
+        The old behavior left it IN_PROGRESS and claimed forever — a
+        permanent slot leak (deadlock at cap=1).
+        """
+        mock_branch.merge_to_main = AsyncMock(return_value=False)
+        lifecycle.get_or_create("60", "kanboard")
+        lifecycle.transition("60", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("60", "kanboard", workflow._agent_id)
+        lifecycle.transition("60", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("60", "kanboard", "alice")
+
+        event = _make_event({"ticket_id": "60", "provider": "kanboard"})
+        await workflow._on_ticket_closed(event)
+
+        rec = lifecycle.get("60", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+        assert rec.ai_agent_id is None  # slot freed
+        mock_kanban.move_task_to_column.assert_any_call("60", "waiting for human")
+
+    @pytest.mark.asyncio
+    async def test_duplicate_signal_ready_does_not_repost_comment(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """A second signal_ready_for_review is a no-op (no duplicate comment)."""
+        lifecycle.get_or_create("70", "kanboard")
+        lifecycle.transition("70", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("70", "kanboard", workflow._agent_id)
+        lifecycle.transition("70", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("70", "kanboard", "alice")
+
+        first = await workflow.signal_ready_for_review("70")
+        comments_after_first = mock_kanban.add_comment.call_count
+
+        second = await workflow.signal_ready_for_review("70")
+
+        assert first is True
+        assert second is False
+        assert mock_kanban.add_comment.call_count == comments_after_first
+        assert lifecycle.get("70", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+
+    @pytest.mark.asyncio
+    async def test_stack_check_failure_parks_ticket_out_of_available_pool(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A stack-check failure parks the ticket in WFH (no re-pickup spam)."""
+        workflow._check_project_stack = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        rec = self._ready_assigned(lifecycle, "80")
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            await workflow._start_ai_work("80", rec)
+
+        parked = lifecycle.get("80", "kanboard")
+        assert parked.state == TicketState.WAITING_FOR_HUMAN
+        assert parked.ai_agent_id is None
+        # Not available → not re-selected on the next pickup (no comment spam).
+        assert "80" not in {r.ticket_id for r in lifecycle.get_available_tickets()}
+
+    @pytest.mark.asyncio
+    async def test_pickup_ignores_foreign_provider_records(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Pickup skips available records from a different provider (no KeyError)."""
+        # A workable, assigned, unclaimed record under a DIFFERENT provider.
+        lifecycle.get_or_create("90", "jira")
+        lifecycle.transition("90", "jira", TicketState.READY)
+        lifecycle.set_assignee("90", "jira", "alice")
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            # Must not raise KeyError trying to claim jira:90 under kanboard.
+            await workflow._pickup_next_ticket()
+
+        assert lifecycle.get("90", "jira").ai_agent_id is None
