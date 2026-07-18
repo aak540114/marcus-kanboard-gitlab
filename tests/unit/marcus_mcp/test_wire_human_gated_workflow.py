@@ -532,3 +532,53 @@ class TestReadBoundedBody:
         req = _FakeRequest(b"x" * 1024, chunk_size=128)
         result = await _read_bounded_body(req, max_bytes=1024)
         assert result == b"x" * 1024
+
+
+class TestAcGeneratorWiredToLLM:
+    """The workflow must get an ACGenerator backed by the configured LLM.
+
+    Without an llm_generate callable, ACGenerator always falls back to a
+    keyword heuristic that produces a near-identical generic checklist
+    for every ticket — the "AC is the same for all tickets" bug. Wiring
+    it to the engine's generate_text() makes AC ticket-specific.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ac_generator_uses_engine_generate_text(self, monkeypatch):
+        monkeypatch.delenv("GITEA_URL", raising=False)
+        server = _make_server()
+        engine = MagicMock()
+        engine.generate_text = AsyncMock(return_value="- [ ] specific")
+        server.ai_engine = engine
+
+        with (
+            patch(
+                "src.workflows.human_gated_workflow.HumanGatedWorkflow",
+                return_value=AsyncMock(),
+            ) as wf_cls,
+            patch("src.marcus_mcp.tools.human_gated.register_workflow"),
+        ):
+            await _wire_human_gated_workflow(server)
+
+        ac_gen = wf_cls.call_args.kwargs["ac_generator"]
+        assert ac_gen is not None
+        # The generator's llm_generate is the engine's generate_text.
+        assert ac_gen._llm_generate is engine.generate_text
+
+    @pytest.mark.asyncio
+    async def test_no_engine_leaves_ac_generator_none(self, monkeypatch):
+        """No ai_engine on the server → ac_generator=None (heuristic default
+        inside the workflow), never a crash."""
+        monkeypatch.delenv("GITEA_URL", raising=False)
+        server = _make_server()  # no ai_engine attribute
+
+        with (
+            patch(
+                "src.workflows.human_gated_workflow.HumanGatedWorkflow",
+                return_value=AsyncMock(),
+            ) as wf_cls,
+            patch("src.marcus_mcp.tools.human_gated.register_workflow"),
+        ):
+            await _wire_human_gated_workflow(server)
+
+        assert wf_cls.call_args.kwargs["ac_generator"] is None

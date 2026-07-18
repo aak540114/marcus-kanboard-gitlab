@@ -1370,3 +1370,39 @@ class TestClaudeSubscriptionMode:
         ai_engine.client = None
         ai_engine._cli_provider = None
         assert ai_engine._llm_available is False
+
+
+class TestGenerateTextRawOutput:
+    """generate_text returns freeform text WITHOUT JSON extraction.
+
+    _call_claude narrows its output to the first {...}/[...] region so
+    structured callers get clean JSON — but that same extraction mangles
+    a markdown acceptance-criteria checklist (every '- [ ]' item contains
+    '[' and ']'). generate_text must skip it so AC generation gets the
+    verbatim checklist.
+    """
+
+    @pytest.fixture
+    def ai_engine(self) -> AIAnalysisEngine:
+        with patch("anthropic.AsyncAnthropic"):
+            engine = AIAnalysisEngine()
+            engine.client = Mock()
+            return engine
+
+    @pytest.mark.asyncio
+    async def test_markdown_checklist_survives_intact(self, ai_engine):
+        checklist = "- [ ] first criterion\n- [ ] second criterion"
+        ai_engine._complete_raw = AsyncMock(return_value=checklist)
+
+        result = await ai_engine.generate_text("write AC")
+
+        assert result == checklist  # NOT truncated to "[ ] first...[ ]"
+
+    @pytest.mark.asyncio
+    async def test_call_claude_still_extracts_json(self, ai_engine):
+        """The structured path is unchanged — JSON is still narrowed."""
+        ai_engine._complete_raw = AsyncMock(
+            return_value='Here you go: {"key": "value"} thanks!'
+        )
+        result = await ai_engine._call_claude("give me json")
+        assert result == '{"key": "value"}'

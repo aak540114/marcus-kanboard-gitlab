@@ -3474,6 +3474,20 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
         )
         server._dev_env_manager = dev_env_mgr  # type: ignore[attr-defined]
 
+    # Wire the acceptance-criteria generator to the configured LLM. Without
+    # this, ACGenerator() has no llm_generate callable and ALWAYS falls back
+    # to a keyword-based heuristic — producing a near-identical generic
+    # checklist for every ticket instead of ticket-specific criteria. The
+    # engine's generate_text() honors the configured provider and returns
+    # freeform markdown (no JSON extraction). Falls back to the heuristic
+    # per-call if the engine is in fallback mode (no LLM backend).
+    ac_generator = None
+    ai_engine = getattr(server, "ai_engine", None)
+    if ai_engine is not None and hasattr(ai_engine, "generate_text"):
+        from src.core.acceptance_criteria import ACGenerator
+
+        ac_generator = ACGenerator(llm_generate=ai_engine.generate_text)
+
     workflow = HumanGatedWorkflow(
         kanban=server.kanban_client,
         events=server.events,
@@ -3486,6 +3500,7 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
         # would keep auto-merging off a stale "ai" gate after a human
         # switched the project back to human-gated in the UI.
         gate_settings=_get_gate_settings_mgr(server),
+        ac_generator=ac_generator,
     )
     register_workflow(workflow)
     await workflow.start()

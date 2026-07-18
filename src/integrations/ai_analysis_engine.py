@@ -1632,6 +1632,109 @@ Return JSON with this format:
             "rationale": "Based on task label matching and project progress",
         }
 
+    async def _complete_raw(self, prompt: str) -> str:
+        """Return the model's raw text for *prompt* (no JSON extraction).
+
+        Shared transport for both :meth:`_call_claude` (which then extracts
+        JSON) and :meth:`generate_text` (which wants the text verbatim, e.g.
+        for a markdown acceptance-criteria checklist that JSON extraction
+        would mangle). Honors the configured provider — the ``claude`` CLI
+        for ``claude_subscription`` or the async Anthropic client otherwise.
+
+        Parameters
+        ----------
+        prompt : str
+            The prompt to send.
+
+        Returns
+        -------
+        str
+            The stripped response text, unaltered.
+
+        Raises
+        ------
+        Exception
+            If no LLM backend is available or the call fails.
+        """
+        if not self._llm_available:
+            raise Exception(
+                "No LLM backend available (no Anthropic client or claude CLI)"
+            )
+
+        # Set context for token tracking if available
+        if self.current_project_id and self.current_agent_id:
+            ai_usage_middleware.set_project_context(
+                self.current_agent_id, self.current_project_id
+            )
+
+        if self._cli_provider is not None:
+            # claude_subscription: shell out through the CLI (its own
+            # subprocess handling is already async + timeout-guarded;
+            # ClaudeCliProvider records its own cost events).
+            return str(await self._cli_provider._call_claude_cli(prompt)).strip()
+
+        assert self.client is not None  # narrowed by _llm_available
+        response = await self.client.messages.create(
+            model=self.model,
+            max_tokens=2000,
+            temperature=0.7,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        # Extract token usage if available
+        if hasattr(response, "usage"):
+            usage = response.usage
+            if self.current_project_id:
+                # Manually track tokens since we're calling the API
+                # directly. Keep a strong reference to the task —
+                # asyncio holds only weak refs, and an unreferenced
+                # task can be GC'd before it runs.
+                import asyncio
+
+                from src.cost_tracking.token_tracker import token_tracker
+
+                task = asyncio.create_task(
+                    token_tracker.track_tokens(
+                        project_id=self.current_project_id,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        model=self.model,
+                        metadata={
+                            "agent_id": self.current_agent_id,
+                            "function": "ai_analysis_engine",
+                            "prompt_length": len(prompt),
+                        },
+                    )
+                )
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+
+        # Handle different response block types
+        content = response.content[0]
+        if hasattr(content, "text"):
+            return str(content.text).strip()
+        return str(content).strip()
+
+    async def generate_text(self, prompt: str) -> str:
+        """Return the model's freeform text response for *prompt*.
+
+        Unlike :meth:`_call_claude`, this does NOT extract JSON — it
+        returns the text verbatim. Used for prompts whose expected output
+        is prose or markdown (e.g. ticket-specific acceptance criteria),
+        where JSON extraction would corrupt the result.
+
+        Parameters
+        ----------
+        prompt : str
+            The prompt to send.
+
+        Returns
+        -------
+        str
+            The model's response text.
+        """
+        return await self._complete_raw(prompt)
+
     async def _call_claude(self, prompt: str) -> str:
         """
         Call Claude API with error handling and token tracking.
@@ -1644,80 +1747,20 @@ Return JSON with this format:
         Returns
         -------
         str
-            Claude's response text
+            Claude's response text, narrowed to the first JSON object/array
+            if one is present (callers here expect structured JSON).
 
         Raises
         ------
         Exception
             If the API call fails or client is unavailable
         """
-        if not self._llm_available:
-            raise Exception(
-                "No LLM backend available (no Anthropic client or claude CLI)"
-            )
-
         try:
-            # Set context for token tracking if available
-            if self.current_project_id and self.current_agent_id:
-                ai_usage_middleware.set_project_context(
-                    self.current_agent_id, self.current_project_id
-                )
-
-            if self._cli_provider is not None:
-                # claude_subscription: shell out through the CLI (its own
-                # subprocess handling is already async + timeout-guarded;
-                # ClaudeCliProvider records its own cost events).
-                text = str(
-                    await self._cli_provider._call_claude_cli(prompt)
-                ).strip()
-            else:
-                assert self.client is not None  # narrowed by _llm_available
-                response = await self.client.messages.create(
-                    model=self.model,
-                    max_tokens=2000,
-                    temperature=0.7,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-
-                # Extract token usage if available
-                if hasattr(response, "usage"):
-                    usage = response.usage
-                    if self.current_project_id:
-                        # Manually track tokens since we're calling the API
-                        # directly. Keep a strong reference to the task —
-                        # asyncio holds only weak refs, and an unreferenced
-                        # task can be GC'd before it runs.
-                        import asyncio
-
-                        from src.cost_tracking.token_tracker import (
-                            token_tracker,
-                        )
-
-                        task = asyncio.create_task(
-                            token_tracker.track_tokens(
-                                project_id=self.current_project_id,
-                                input_tokens=usage.input_tokens,
-                                output_tokens=usage.output_tokens,
-                                model=self.model,
-                                metadata={
-                                    "agent_id": self.current_agent_id,
-                                    "function": "ai_analysis_engine",
-                                    "prompt_length": len(prompt),
-                                },
-                            )
-                        )
-                        self._bg_tasks.add(task)
-                        task.add_done_callback(self._bg_tasks.discard)
-
-                # Handle different response block types
-                content = response.content[0]
-                if hasattr(content, "text"):
-                    text = str(content.text).strip()
-                else:
-                    text = str(content).strip()
+            text = await self._complete_raw(prompt)
 
             # Extract JSON from response (LLMs often wrap in fences or add
-            # prose) — applies identically to both transports.
+            # prose). NOTE: only for the structured-JSON callers — the
+            # freeform generate_text() path deliberately skips this.
             start = text.find("{") if "{" in text else text.find("[")
             if start != -1:
                 end = text.rfind("}") if "{" in text else text.rfind("]")
