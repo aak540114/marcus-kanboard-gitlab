@@ -11,10 +11,13 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | Feature | Description |
 |---|---|
 | **Kanboard provider** | Full Kanboard JSON-RPC integration — tickets, columns, comments, assignments |
-| **Gitea integration** | `GiteaManager` + `ProjectSyncWorkflow` (`src/integrations/gitea_manager.py`, `src/workflows/project_sync_workflow.py`) auto-create a Gitea repo the first time an agent calls `get_work_context` for a ticket whose project doesn't have one yet — no manual repo setup. |
+| **Gitea integration** | `GiteaManager` + `ProjectSyncWorkflow` (`src/integrations/gitea_manager.py`, `src/workflows/project_sync_workflow.py`) auto-create a Gitea repo per Kanboard project — proactively via a `ProjectWatcher` poll, and on-demand the first time an agent calls `get_work_context` — no manual repo setup. |
+| **Parallel agents** | `HumanGatedWorkflow` keeps up to `MARCUS_MAX_PARALLEL_AGENTS` (default 3) tickets in progress at once, each held by a distinct agent "slot". A busy slot is never preempted, so an agent actively working is never interrupted; extra assigned tickets simply wait for a free slot. |
+| **Zero-setup agent clone** | `get_work_context` returns a ready-to-run `clone_url` (browser-facing host from `GITEA_PUBLIC_URL`, git credentials embedded unless `MARCUS_EMBED_GIT_CREDENTIALS=false`). The agent clones into **its own** directory — no manual clone, and parallel agents never share a working tree. Prefer a scoped `GITEA_AGENT_TOKEN` over the admin token. |
+| **Kanboard → code links** | The board header links to the project's Gitea repo; each ticket's sidebar links to the exact branch it's worked on — jump from board to code in one click. |
 | **MarcusDevEnv plugin** | Kanboard plugin that adds AI-aware UI to every board and task |
 | **Hot-reload dev environments** | One-click per-ticket preview URL; supports any language/framework via project description. Refreshes **instantly** on every `git push` to the ticket branch via a Gitea webhook (`/webhooks/gitea`) — no polling, no manual webhook setup. A global "Max dev environments" setting caps how many preview containers can run at once. |
-| **Project Description system** | Per-project markdown doc (tech stack, architecture notes) that AI agents read via the `get_project_description` MCP tool; editable from the board |
+| **Project Description system** | Per-project markdown doc (tech stack, architecture notes) AI agents read via `get_project_description`. Marcus **infers** it from the ticket when it's missing — instead of blocking the ticket on a human — and agents can refine it via `update_project_description`. A human's edit always wins and is never overwritten. Editable from the board. |
 | **Enriched ticket context** | `get_work_context` — the first call every agent makes — also returns priority, labels, due date, estimated hours, dependency links (`depends_on`/`blocks`/`relates_to`), and the ticket's last 10 comments, so a human's reply to a paused ticket is actually visible to the agent |
 | **Human Gate / AI Gate toggle** | Per-project and per-ticket control over whether humans review AI work before it merges |
 | **AI Verify** | Configurable N-round LLM code review before any AI-gate merge; each round posts a comment with findings; agent fixes issues between rounds; 0 rounds = disabled |
@@ -47,6 +50,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 |---|---|
 | **Active AI Agents badge** | Live green/grey/amber badge showing how many tickets are currently held by an AI agent. Updates every 15 s; hover to see ticket IDs. |
 | **Project Description button** | Opens the Marcus-served project description page for this project — the AI agents' shared source of truth for language, framework, and architecture. |
+| **Repository button** | Links to this project's Gitea repository (opens in a new tab). Appears once the repo has been provisioned. |
 | **Human Gate / AI Gate toggle** | Sets the project-level gate mode. Human Gate (default): AI pauses for human review before done. AI Gate: AI merges and closes autonomously. |
 | **AI Verify counter** | Appears when AI Gate is active. `[−] N [+]` sets how many sequential LLM review rounds run before the branch auto-merges. 0 = disabled. |
 | **Max dev environments counter** | Global, always visible. `[−] N [+]` caps how many "Open Dev Environment" Docker containers can run at once across every ticket — `∞` (default) means unlimited. Once the limit is reached, starting a new one fails until an existing one is stopped. |
@@ -54,6 +58,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 ### Task sidebar
 | Panel | What it does |
 |---|---|
+| **Marcus Code** | Link to the exact Gitea branch this ticket is worked on, so you can review the code updates on the branch at any time. |
 | **Marcus Dev Environment** | Start / Open / Stop a hot-reload preview for this ticket's branch. Any language — stack comes from the project description. |
 | **Marcus Gate Mode** | Per-ticket gate override. Shows the project default; lets you switch this ticket to Human or AI gate independently. Ticket setting overrides project setting. Includes a per-ticket AI Verify override when AI Gate is active. |
 | **Marcus Dependencies** | Dependency graph: *Depends on*, *Blocks*, *Related* — each with a colour-coded column-status badge. |
@@ -72,14 +77,14 @@ kanboard (container, host port 8080) ← Kanboard JSON-RPC API (internal port 80
   │  ProjectWatcher polls               │  BoardWatcher polls (30s) + webhook (instant)
   ▼  getAllProjects()                   ▼  getAllTasks()
 marcus (container, host port 4298) ─── marcus (container)
-  │  GiteaManager*                      │  BranchManager + HumanGatedWorkflow
-  ▼  POST /api/v1/user/repos            ▼  git push branch
+  │  GiteaManager + ProjectWatcher     │  BranchManager + HumanGatedWorkflow
+  ▼  POST /api/v1/user/repos           ▼  git push branch
 gitea (container, host port 3000) ──── gitea — branch per ticket
 
 AI agents (Claude Code, Codex, etc.)
   └── connect to http://localhost:4298/mcp  (MCP protocol)
       │   (remote agents: + Authorization: Bearer <MARCUS_AGENT_TOKEN>)
-      ├── request_next_task
+      ├── get_work_context           → clone_url → git clone (own dir)
       ├── signal_ready_for_review    → Human Gate: "Waiting for Human"
       │                              → AI Gate:    auto-merge + "Done"
       ├── signal_waiting_for_human   → Human Gate: pause for input
@@ -87,15 +92,13 @@ AI agents (Claude Code, Codex, etc.)
       └── post_ticket_progress
 ```
 
-\* Not wired into the running server yet — see the Gitea integration row above.
-
 ### How AI agents reach tickets
 
 AI agents never call Kanboard's JSON-RPC API and never receive Kanboard's API token. They call Marcus's MCP tools (`get_work_context`, `get_project_description`, `post_ticket_progress`, `signal_ready_for_review`, …); Marcus alone holds `KANBOARD_API_TOKEN` and is the only thing that makes JSON-RPC calls to Kanboard, over the internal Docker network (`http://kanboard/jsonrpc.php`, not the host-published `:8080`). No tool response ever contains a Kanboard URL or credential. This is why gating Marcus's HTTP endpoint with a bearer token (see [Authenticating remote agents](#authenticating-remote-agents)) is sufficient to control ticket access: it's the *only* door.
 
-`get_work_context` — the first call every agent makes — returns everything Marcus knows about a ticket: title, description, acceptance criteria, branch/repo info, priority, labels, due date, estimated hours, dependency links (`depends_on`/`blocks`/`relates_to`), and its last 10 comments (see `prompts/Kanboard_Agent_Prompt.md` for the full field reference). `get_project_description` returns the project-wide tech stack and architecture notes when per-ticket context isn't enough.
+`get_work_context` — the first call every agent makes — returns everything Marcus knows about a ticket: title, description, acceptance criteria, a ready-to-run `clone_url` (plus `repo_web_url`/`branch_web_url`), branch name, priority, labels, due date, estimated hours, dependency links (`depends_on`/`blocks`/`relates_to`), and its last 10 comments (see `prompts/Kanboard_Agent_Prompt.md` for the full field reference). `get_project_description` returns the project-wide tech stack and architecture notes when per-ticket context isn't enough.
 
-Agents do talk to **Gitea** directly, but only for `git clone`/`fetch`/`push` on the one branch Marcus created for them — a different, narrower surface than the board itself.
+Agents do talk to **Gitea** directly, but only to `git clone` the `clone_url` into their own directory and `fetch`/`push` on the one branch Marcus created for them — a different, narrower surface than the board itself. They never share Marcus's own clone, so parallel agents don't collide.
 
 ---
 
@@ -183,6 +186,8 @@ claude mcp add --transport http marcus http://localhost:4298/mcp
 ```
 
 This always works from the same machine Marcus runs on. Connecting from a **different machine** (another laptop, a remote VPS) additionally requires you to have opted in during setup — see [Network access](#network-access).
+
+Once connected, point the agent at a ticket: it calls `get_work_context`, which returns a `clone_url` it uses to `git clone` the ticket's repo into its own directory, then works on the pre-made branch — no manual clone step. `prompts/Kanboard_Agent_Prompt.md` is the full agent operating manual (auth, gate modes, the tool call sequence). For a **remote** agent to clone a private repo seamlessly, set `GITEA_PUBLIC_URL` to a browser-reachable address and provide a `GITEA_AGENT_TOKEN`.
 
 ### Tearing down
 
@@ -380,9 +385,10 @@ When `MARCUS_AGENT_TOKEN` is set (automatic once you allow remote access — see
 | `/api/dev-env/status?ticket_id=<id>` | GET | Returns `{running, url}` for a ticket's dev environment |
 | `/api/dev-env-setting` | GET/PUT | Global `max_parallel_containers` limit (`null` = unlimited) — see [Hot-reload dev environments](#hot-reload-dev-environments) |
 | `/api/active-agents` | GET | All tickets currently claimed by an AI agent |
-| `/api/ticket-links?ticket_id=<id>` | GET | Dependency graph split into `depends_on`, `blocks`, `relates_to` |
+| `/api/ticket-links?ticket_id=<id>` | GET | Dependency graph (`depends_on`/`blocks`/`relates_to`) plus the ticket's `repo_web_url` and `branch_web_url` |
+| `/api/project-repo?project_id=<id>` | GET | Browser URL of the project's Gitea repo (`null` until provisioned) — backs the board's Repository button |
 | `/project-description?project_id=<id>` | GET | Editable project description page |
-| `/api/project-description?project_id=<id>` | GET/PUT | Project description plain-text API |
+| `/api/project-description?project_id=<id>` | GET/PUT | Project description plain-text API (a human PUT locks it against automated overwrites) |
 | `/api/gate-setting?project_id=<id>[&ticket_id=<id>]` | GET | Current gate + verify settings; returns `project_gate`, `ticket_gate`, `effective`, `project_verify_count`, `ticket_verify_count`, `effective_verify_count` |
 | `/api/gate-setting/project` | PUT | Set project-level gate (`human`\|`ai`) and/or `verify_count` (int ≥ 0) |
 | `/api/gate-setting/ticket` | PUT | Set per-ticket gate override (`human`\|`ai`\|`null`) and/or `verify_count` (int ≥ 0 or `null` to inherit) |
