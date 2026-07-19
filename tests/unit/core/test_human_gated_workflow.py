@@ -1196,6 +1196,108 @@ class TestGetWorkContext:
         assert ctx["already_claimed_by"] == "marcus-abc123"
 
 
+class TestAgentGitUrls:
+    """_agent_git_urls rehosts + credentials the URLs handed to agents."""
+
+    def _wire_gitea(self, workflow, username="root", token="adminTok"):
+        gitea = MagicMock()
+        gitea._username = username
+        gitea._token = token
+        ps = MagicMock()
+        ps._gitea = gitea
+        workflow._project_sync = ps
+
+    def test_embeds_admin_token_and_rehosts_by_default(
+        self, workflow, monkeypatch
+    ):
+        """Default: browser host + admin creds embedded in clone_url."""
+        monkeypatch.delenv("GITEA_AGENT_TOKEN", raising=False)
+        monkeypatch.delenv("GITEA_PUBLIC_URL", raising=False)
+        monkeypatch.delenv("MARCUS_EMBED_GIT_CREDENTIALS", raising=False)
+        self._wire_gitea(workflow)
+
+        urls = workflow._agent_git_urls(
+            "http://gitea:3000/root/app.git", "ticket/kanboard/5"
+        )
+        assert urls["clone_url"] == "http://root:adminTok@localhost:3000/root/app.git"
+        assert urls["repo_web_url"] == "http://localhost:3000/root/app"
+        assert (
+            urls["branch_web_url"]
+            == "http://localhost:3000/root/app/src/branch/ticket/kanboard/5"
+        )
+
+    def test_dedicated_agent_token_takes_precedence(self, workflow, monkeypatch):
+        """GITEA_AGENT_TOKEN/USERNAME override the admin token."""
+        monkeypatch.setenv("GITEA_AGENT_TOKEN", "scopedTok")
+        monkeypatch.setenv("GITEA_AGENT_USERNAME", "marcus-agent")
+        monkeypatch.delenv("GITEA_PUBLIC_URL", raising=False)
+        monkeypatch.delenv("MARCUS_EMBED_GIT_CREDENTIALS", raising=False)
+        self._wire_gitea(workflow)
+
+        urls = workflow._agent_git_urls(
+            "http://gitea:3000/root/app.git", "ticket/kanboard/5"
+        )
+        assert (
+            urls["clone_url"]
+            == "http://marcus-agent:scopedTok@localhost:3000/root/app.git"
+        )
+
+    def test_embed_disabled_returns_plain_clone_url(self, workflow, monkeypatch):
+        """MARCUS_EMBED_GIT_CREDENTIALS=false → no creds in clone_url."""
+        monkeypatch.setenv("MARCUS_EMBED_GIT_CREDENTIALS", "false")
+        monkeypatch.setenv("GITEA_PUBLIC_URL", "https://git.example.com")
+        self._wire_gitea(workflow)
+
+        urls = workflow._agent_git_urls(
+            "http://gitea:3000/root/app.git", "ticket/kanboard/5"
+        )
+        assert urls["clone_url"] == "https://git.example.com/root/app.git"
+        assert "@" not in urls["clone_url"]
+
+    @pytest.mark.asyncio
+    async def test_get_work_context_includes_clone_and_branch_urls(
+        self, workflow, lifecycle, mock_kanban, monkeypatch
+    ):
+        """get_work_context surfaces clone_url + branch_web_url from the mapping."""
+        monkeypatch.delenv("GITEA_PUBLIC_URL", raising=False)
+        monkeypatch.delenv("MARCUS_EMBED_GIT_CREDENTIALS", raising=False)
+        lifecycle.get_or_create("60", "kanboard", branch_name="ticket/kanboard/60")
+
+        task = MagicMock()
+        task.name = "Build it"
+        task.description = ""
+        task.source_context = {"kanboard_task": {"project_id": 3}}
+        task.priority = None
+        task.labels = []
+        task.due_date = None
+        task.estimated_hours = None
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+
+        gitea = MagicMock()
+        gitea._username = "root"
+        gitea._token = "adminTok"
+        ps = MagicMock()
+        ps._gitea = gitea
+        ps.get_repo_for_project = MagicMock(
+            return_value={
+                "local_repo_path": "/data/repos/app",
+                "gitea_repo_url": "http://gitea:3000/root/app.git",
+            }
+        )
+        workflow._project_sync = ps
+
+        ctx = await workflow.get_work_context("60")
+        assert ctx is not None
+        assert ctx["clone_url"] == "http://root:adminTok@localhost:3000/root/app.git"
+        assert (
+            ctx["branch_web_url"]
+            == "http://localhost:3000/root/app/src/branch/ticket/kanboard/60"
+        )
+        assert ctx["repo_web_url"] == "http://localhost:3000/root/app"
+        # Instructions tell the agent to clone, not reuse Marcus's path.
+        assert "git clone" in ctx["instructions"]
+
+
 # ---------------------------------------------------------------------------
 # get_work_context: enriched ticket data (priority/labels/due_date/
 # estimated_hours/links/recent_comments)

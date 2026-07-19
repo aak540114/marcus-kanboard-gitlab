@@ -414,6 +414,111 @@ def _auth_clone_url(clone_url: str, username: str, token: str) -> str:
     return clone_url
 
 
+def _rehost(url: str, public_base: str) -> str:
+    """Swap a Gitea URL's scheme+host for the browser-facing base.
+
+    The clone URLs Marcus stores are built from ``self._base`` — the
+    address Marcus itself reaches Gitea on (e.g. ``http://gitea:3000``
+    inside Docker) — which a human's browser or a remote agent cannot
+    resolve. This replaces the scheme+authority with *public_base* while
+    preserving the ``/owner/slug(.git)`` path.
+
+    Parameters
+    ----------
+    url : str
+        A Gitea URL, e.g. ``http://gitea:3000/root/shopping-cart.git``.
+    public_base : str
+        Browser-facing base, e.g. ``http://localhost:3000`` or
+        ``https://git.example.com``.
+
+    Returns
+    -------
+    str
+        The URL rehosted onto *public_base*.
+    """
+    public_base = public_base.rstrip("/")
+    match = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]+(/.*)?$", url)
+    path = (match.group(1) if match and match.group(1) else "/" + url.lstrip("/"))
+    return f"{public_base}{path}"
+
+
+def public_repo_web_url(internal_clone_url: str, public_base: str) -> str:
+    """Return the browser URL of a repo (no ``.git``, browser-facing host).
+
+    Parameters
+    ----------
+    internal_clone_url : str
+        Marcus-internal clone URL, e.g. ``http://gitea:3000/root/app.git``.
+    public_base : str
+        Browser-facing Gitea base URL.
+
+    Returns
+    -------
+    str
+        e.g. ``http://localhost:3000/root/app``.
+    """
+    rehosted = _rehost(internal_clone_url, public_base)
+    return rehosted[:-4] if rehosted.endswith(".git") else rehosted
+
+
+def public_branch_web_url(
+    internal_clone_url: str, public_base: str, branch: str
+) -> str:
+    """Return the browser URL that shows a specific branch's code.
+
+    Parameters
+    ----------
+    internal_clone_url : str
+        Marcus-internal clone URL.
+    public_base : str
+        Browser-facing Gitea base URL.
+    branch : str
+        Branch name, e.g. ``ticket/kanboard/42``.
+
+    Returns
+    -------
+    str
+        e.g. ``http://localhost:3000/root/app/src/branch/ticket/kanboard/42``.
+        Falls back to the repo root URL when *branch* is empty.
+    """
+    repo = public_repo_web_url(internal_clone_url, public_base)
+    if not branch:
+        return repo
+    return f"{repo}/src/branch/{branch}"
+
+
+def public_authenticated_clone_url(
+    internal_clone_url: str, public_base: str, username: str, token: str
+) -> str:
+    """Return a browser-facing clone URL with credentials embedded.
+
+    Rehosts the internal clone URL onto *public_base*, then embeds
+    ``username:token`` so a remote agent can ``git clone`` a private repo
+    without any separate credential setup. When *token* is empty the plain
+    (credential-less) rehosted URL is returned.
+
+    Parameters
+    ----------
+    internal_clone_url : str
+        Marcus-internal clone URL.
+    public_base : str
+        Browser-facing Gitea base URL.
+    username : str
+        Gitea username that owns *token*.
+    token : str
+        Gitea Personal Access Token (may be empty).
+
+    Returns
+    -------
+    str
+        e.g. ``http://root:<token>@localhost:3000/root/app.git``.
+    """
+    rehosted = _rehost(internal_clone_url, public_base)
+    if not token:
+        return rehosted
+    return _auth_clone_url(rehosted, username, token)
+
+
 async def _run_git(args: List[str], cwd: str) -> None:
     """Run a git command asynchronously, raising RuntimeError on non-zero exit.
 

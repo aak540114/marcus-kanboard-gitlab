@@ -1378,10 +1378,23 @@ class HumanGatedWorkflow:
         # Subsequent calls just hit the cached mapping.
         local_repo_path: Optional[str] = None
         gitea_repo_url: Optional[str] = None
+        clone_url: Optional[str] = None
+        repo_web_url: Optional[str] = None
+        branch_web_url: Optional[str] = None
         mapping = await self._resolve_project_repo_mapping(kanboard_project_id)
         if mapping:
             local_repo_path = mapping.get("local_repo_path")
             gitea_repo_url = mapping.get("gitea_repo_url")
+            if gitea_repo_url:
+                urls = self._agent_git_urls(gitea_repo_url, record.branch_name)
+                clone_url = urls["clone_url"]
+                repo_web_url = urls["repo_web_url"]
+                branch_web_url = urls["branch_web_url"]
+
+        gate_is_ai = (
+            kanboard_project_id is not None
+            and self._gate.get_effective_gate(ticket_id, kanboard_project_id) == "ai"
+        )
 
         return {
             "ticket_id": ticket_id,
@@ -1390,8 +1403,18 @@ class HumanGatedWorkflow:
             "description": description,
             "acceptance_criteria": record.acceptance_criteria or "",
             "branch_name": record.branch_name,
+            # Marcus's OWN internal clone path — the agent no longer uses it
+            # for its working copy (it does a fresh clone; see instructions).
+            # Kept for reference / co-located tooling.
             "local_repo_path": local_repo_path,
             "gitea_repo_url": gitea_repo_url,
+            # Browser-facing, ready-to-use URLs (see _agent_git_urls). The
+            # agent clones `clone_url` (credentials embedded when configured)
+            # into its OWN directory — never a shared path — so parallel
+            # agents never share a working tree.
+            "clone_url": clone_url,
+            "repo_web_url": repo_web_url,
+            "branch_web_url": branch_web_url,
             "state": record.state.value,
             "assignee": record.assignee,
             "already_claimed_by": record.ai_agent_id,
@@ -1411,18 +1434,18 @@ class HumanGatedWorkflow:
                 else "human"
             ),
             "instructions": (
-                "1. cd into local_repo_path\n"
-                "2. git checkout branch_name\n"
+                "1. git clone <clone_url> into a NEW directory of your own "
+                "(do NOT reuse local_repo_path — that is Marcus's clone), "
+                "then cd into it\n"
+                "2. git checkout <branch_name>  (it already exists on the "
+                "remote; use `git checkout -B <branch_name> origin/<branch_name>`)\n"
                 "3. Read the description and acceptance_criteria\n"
-                "4. Implement the work; commit and push to the branch\n"
+                "4. Implement the work; commit and `git push origin <branch_name>`\n"
                 "5. Call signal_ready_for_review when done"
                 + (
                     " — NOTE: gate_mode is 'ai', so this will auto-merge and "
                     "complete without human review."
-                    if (
-                        kanboard_project_id is not None
-                        and self._gate.get_effective_gate(ticket_id, kanboard_project_id) == "ai"
-                    )
+                    if gate_is_ai
                     else ", or signal_waiting_for_human / signal_blocked if stuck"
                 )
             ),
@@ -1932,6 +1955,85 @@ class HumanGatedWorkflow:
                 next_rec.state.value,
             )
             await self._start_ai_work(next_rec.ticket_id, next_rec)
+
+    def _agent_git_urls(
+        self, internal_clone_url: str, branch_name: str
+    ) -> Dict[str, str]:
+        """Build browser-facing git URLs to hand an agent for a ticket.
+
+        Marcus stores clone URLs on its OWN internal Gitea address (e.g.
+        ``http://gitea:3000`` in Docker), which a remote agent or a human's
+        browser cannot reach. This rehosts them onto ``GITEA_PUBLIC_URL``
+        (default ``http://localhost:3000``) and returns:
+
+        - ``clone_url`` — ready to ``git clone``. Credentials are embedded
+          (so a private repo clones with no separate setup) when
+          ``MARCUS_EMBED_GIT_CREDENTIALS`` is truthy (default) AND a token is
+          available. **Security:** this hands a Gitea token to every agent
+          and into its LLM context — prefer a dedicated, repo-scoped token
+          via ``GITEA_AGENT_TOKEN`` over the admin ``GITEA_TOKEN``; set
+          ``MARCUS_EMBED_GIT_CREDENTIALS=false`` to return a credential-less
+          URL and configure git auth on the agent host instead.
+        - ``repo_web_url`` — browser link to the repository.
+        - ``branch_web_url`` — browser link to this ticket's branch.
+
+        Parameters
+        ----------
+        internal_clone_url : str
+            The ``gitea_repo_url`` from the project mapping.
+        branch_name : str
+            The ticket's branch.
+
+        Returns
+        -------
+        Dict[str, str]
+            ``{clone_url, repo_web_url, branch_web_url}``.
+        """
+        from src.integrations.gitea_manager import (
+            public_authenticated_clone_url,
+            public_branch_web_url,
+            public_repo_web_url,
+        )
+
+        public_base = (
+            os.environ.get("GITEA_PUBLIC_URL") or "http://localhost:3000"
+        ).strip()
+
+        embed = os.environ.get(
+            "MARCUS_EMBED_GIT_CREDENTIALS", "true"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+        # Prefer a dedicated, repo-scoped agent token (a leak is contained to
+        # the project repos) over Marcus's admin GITEA_TOKEN (full instance
+        # access). GITEA_AGENT_USERNAME names that token's owner for HTTP
+        # Basic auth; default to the admin username otherwise.
+        gitea = getattr(self._project_sync, "_gitea", None)
+        admin_user = (getattr(gitea, "_username", None) if gitea else None) or "root"
+        agent_token = os.environ.get("GITEA_AGENT_TOKEN", "").strip()
+        if agent_token:
+            token = agent_token
+            username = os.environ.get("GITEA_AGENT_USERNAME", "").strip() or admin_user
+        else:
+            token = (
+                (getattr(gitea, "_token", None) if gitea else None)
+                or os.environ.get("GITEA_TOKEN", "")
+            )
+            username = admin_user
+
+        clone_url = (
+            public_authenticated_clone_url(
+                internal_clone_url, public_base, username, token
+            )
+            if embed
+            else public_repo_web_url(internal_clone_url, public_base) + ".git"
+        )
+        return {
+            "clone_url": clone_url,
+            "repo_web_url": public_repo_web_url(internal_clone_url, public_base),
+            "branch_web_url": public_branch_web_url(
+                internal_clone_url, public_base, branch_name
+            ),
+        }
 
     @staticmethod
     def _mcp_server_url() -> str:

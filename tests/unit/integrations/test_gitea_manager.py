@@ -13,6 +13,9 @@ from src.integrations.gitea_manager import (
     GiteaManager,
     _auth_clone_url,
     _slugify,
+    public_authenticated_clone_url,
+    public_branch_web_url,
+    public_repo_web_url,
 )
 
 
@@ -68,6 +71,73 @@ class TestAuthCloneUrl:
     def test_unknown_scheme_passthrough(self):
         url = _auth_clone_url("git@localhost:root/app.git", "root", "tok")
         assert url == "git@localhost:root/app.git"
+
+
+class TestPublicUrlHelpers:
+    """Rehosting Marcus-internal Gitea URLs to browser-facing ones."""
+
+    def test_repo_web_url_rehosts_and_strips_git(self):
+        """Internal clone URL → browser repo URL (public host, no .git)."""
+        assert (
+            public_repo_web_url(
+                "http://gitea:3000/root/shopping-cart.git",
+                "http://localhost:3000",
+            )
+            == "http://localhost:3000/root/shopping-cart"
+        )
+
+    def test_repo_web_url_honors_https_public_base(self):
+        """An HTTPS public base (real domain) is preserved."""
+        assert (
+            public_repo_web_url(
+                "http://gitea:3000/root/app.git", "https://git.example.com/"
+            )
+            == "https://git.example.com/root/app"
+        )
+
+    def test_branch_web_url_points_at_the_branch(self):
+        """Branch URL is repo + /src/branch/<branch> on the public host."""
+        assert (
+            public_branch_web_url(
+                "http://gitea:3000/root/app.git",
+                "http://localhost:3000",
+                "ticket/kanboard/42",
+            )
+            == "http://localhost:3000/root/app/src/branch/ticket/kanboard/42"
+        )
+
+    def test_branch_web_url_falls_back_to_repo_when_branch_empty(self):
+        """No branch → repo root URL (no dangling /src/branch/)."""
+        assert (
+            public_branch_web_url(
+                "http://gitea:3000/root/app.git", "http://localhost:3000", ""
+            )
+            == "http://localhost:3000/root/app"
+        )
+
+    def test_authenticated_clone_url_embeds_creds_on_public_host(self):
+        """Clone URL is rehosted to the public host with creds embedded."""
+        assert (
+            public_authenticated_clone_url(
+                "http://gitea:3000/root/app.git",
+                "http://localhost:3000",
+                "root",
+                "tok123",
+            )
+            == "http://root:tok123@localhost:3000/root/app.git"
+        )
+
+    def test_authenticated_clone_url_without_token_is_plain(self):
+        """Empty token → plain rehosted URL, no credentials embedded."""
+        assert (
+            public_authenticated_clone_url(
+                "http://gitea:3000/root/app.git",
+                "http://localhost:3000",
+                "root",
+                "",
+            )
+            == "http://localhost:3000/root/app.git"
+        )
 
 
 class TestConnect:
