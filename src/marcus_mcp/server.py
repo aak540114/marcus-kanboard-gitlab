@@ -4450,16 +4450,83 @@ function save() {{
                 else:
                     relates_to.append(entry)
 
+            # Browser links to the ticket's Gitea repo + branch (credential
+            # free), so the sidebar can show a "view the code on this branch"
+            # link. Best-effort: None until the project's repo is provisioned.
+            repo_web_url = None
+            branch_web_url = None
+            wf = getattr(server, "_human_gated_workflow", None)
+            if wf is not None:
+                try:
+                    repo_links = await wf.get_repo_links(ticket_id)
+                    if repo_links:
+                        repo_web_url = repo_links.get("repo_web_url")
+                        branch_web_url = repo_links.get("branch_web_url")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("ticket_links: repo link lookup failed: %s", exc)
+
             payload = {
                 "ticket_id":  ticket_id,
                 "depends_on": depends_on,
                 "blocks":     blocks,
                 "relates_to": relates_to,
+                "repo_web_url": repo_web_url,
+                "branch_web_url": branch_web_url,
             }
             response = JSONResponse(payload)
             response.headers["Access-Control-Allow-Origin"] = "*"
             response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
             return response
+
+        async def project_repo(request: Request) -> JSONResponse:
+            """Return the browser URL of a Kanboard project's Gitea repo.
+
+            Query params
+            ------------
+            project_id : str  (required, numeric)
+
+            Response body
+            -------------
+            ``{"project_id": "<str>", "repo_web_url": "<str>|null"}`` —
+            ``repo_web_url`` is ``null`` until the project's repo is
+            provisioned. Used by the MarcusDevEnv board header to link a
+            project to its repository.
+            """
+            def _cors(r: JSONResponse) -> JSONResponse:
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                r.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+                return r
+
+            project_id = request.query_params.get("project_id", "").strip()
+            if not project_id:
+                return _cors(
+                    JSONResponse(
+                        {"error": "project_id query parameter is required"},
+                        status_code=400,
+                    )
+                )
+            try:
+                pid = int(project_id)
+            except ValueError:
+                return _cors(
+                    JSONResponse(
+                        {"error": "project_id must be a numeric Kanboard id"},
+                        status_code=400,
+                    )
+                )
+
+            repo_web_url = None
+            wf = getattr(server, "_human_gated_workflow", None)
+            if wf is not None:
+                try:
+                    repo_web_url = wf.get_project_repo_url(pid)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("project_repo lookup failed: %s", exc)
+            return _cors(
+                JSONResponse(
+                    {"project_id": project_id, "repo_web_url": repo_web_url}
+                )
+            )
 
         mcp_app = fastmcp.streamable_http_app()
 
@@ -4529,6 +4596,7 @@ function save() {{
                 Route("/api/dev-env/status", dev_env_status, methods=["GET"]),
                 Route("/api/active-agents", active_agents, methods=["GET"]),
                 Route("/api/ticket-links", ticket_links, methods=["GET"]),
+                Route("/api/project-repo", project_repo, methods=["GET"]),
                 Route("/project-description", project_description_page, methods=["GET"]),
                 Route("/api/project-description", project_description_api, methods=["GET", "PUT"]),
                 Route("/api/gate-setting", gate_setting_api, methods=["GET"]),

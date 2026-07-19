@@ -1956,6 +1956,91 @@ class HumanGatedWorkflow:
             )
             await self._start_ai_work(next_rec.ticket_id, next_rec)
 
+    async def _resolve_kanboard_project_id(
+        self, ticket_id: str
+    ) -> Optional[int]:
+        """Best-effort resolve a ticket's Kanboard project id, or ``None``."""
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task:
+                raw = (task.source_context or {}).get("kanboard_task", {})
+                pid_raw = raw.get("project_id")
+                if pid_raw:
+                    return int(pid_raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not resolve project id for %s: %s", ticket_id, exc)
+        return None
+
+    def _project_internal_repo_url(
+        self, project_id: Optional[int]
+    ) -> Optional[str]:
+        """Return a project's stored (internal) Gitea clone URL, or ``None``.
+
+        NON-provisioning: uses the cached mapping only, so read-only callers
+        (the Kanboard UI link routes) never trigger repo creation as a side
+        effect. Returns ``None`` until the repo has actually been provisioned.
+        """
+        if self._project_sync is None or project_id is None:
+            return None
+        mapping = self._project_sync.get_repo_for_project(project_id)
+        if not mapping:
+            return None
+        return cast(Optional[str], mapping.get("gitea_repo_url"))
+
+    async def get_repo_links(self, ticket_id: str) -> Optional[Dict[str, str]]:
+        """Return browser links to a ticket's repo and branch, or ``None``.
+
+        Credential-free (unlike ``get_work_context``'s ``clone_url``) — these
+        are for humans clicking through from Kanboard. Non-provisioning:
+        returns ``None`` until the project's repo exists.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Kanboard task id.
+
+        Returns
+        -------
+        Optional[Dict[str, str]]
+            ``{repo_web_url, branch_web_url}`` or ``None``.
+        """
+        project_id = await self._resolve_kanboard_project_id(ticket_id)
+        internal = self._project_internal_repo_url(project_id)
+        if not internal:
+            return None
+        record = self._lifecycle.get(ticket_id, self._provider)
+        branch = (
+            record.branch_name
+            if record and record.branch_name
+            else BranchManager.make_branch_name(self._provider, ticket_id)
+        )
+        urls = self._agent_git_urls(internal, branch)
+        return {
+            "repo_web_url": urls["repo_web_url"],
+            "branch_web_url": urls["branch_web_url"],
+        }
+
+    def get_project_repo_url(self, project_id: int) -> Optional[str]:
+        """Return the browser URL of a project's Gitea repo, or ``None``.
+
+        Non-provisioning (cached mapping only). Used by the Kanboard board
+        header to link a project to its repository.
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project id.
+
+        Returns
+        -------
+        Optional[str]
+            The repo's browser URL, or ``None`` if not provisioned yet.
+        """
+        internal = self._project_internal_repo_url(project_id)
+        if not internal:
+            return None
+        return self._agent_git_urls(internal, "")["repo_web_url"]
+
     def _agent_git_urls(
         self, internal_clone_url: str, branch_name: str
     ) -> Dict[str, str]:

@@ -77,8 +77,11 @@ The response contains:
 | `description` | Full requirements from the human |
 | `acceptance_criteria` | Checklist of what "done" means — read this carefully |
 | `branch_name` | The git branch Marcus created for you |
-| `local_repo_path` | Absolute path to the git repo on disk |
-| `gitea_repo_url` | Gitea remote URL (for reference) |
+| `clone_url` | **Use this to clone.** Ready-to-run URL, credentials embedded when configured — clone it into your OWN fresh directory |
+| `repo_web_url` | Browser link to the repository (for reference) |
+| `branch_web_url` | Browser link to your branch's code (for reference) |
+| `local_repo_path` | Marcus's OWN internal clone path — **do not use it** as your workspace (it's shared / may be on another host); always clone `clone_url` yourself |
+| `gitea_repo_url` | Marcus-internal Gitea remote (not browser-reachable; prefer `clone_url`) |
 | `state` | Should be `in_progress` — if not, do not proceed |
 | `priority` | `low` / `medium` / `high` / `urgent`, or `null` if unset |
 | `labels` | Kanboard tags on the ticket, e.g. `["backend", "urgent"]` |
@@ -117,14 +120,23 @@ It returns `{project_id, description, stack}`, where `stack` is `{language, fram
 
 ## 4. Set up your workspace
 
+Clone the repo **into a fresh directory of your own** — do NOT use
+`local_repo_path` (that is Marcus's own internal clone; sharing it would
+collide with other agents). `get_work_context` gives you a ready-to-use
+`clone_url` (credentials already embedded when Marcus is configured for it,
+so a private repo just clones):
+
 ```bash
-cd <local_repo_path from get_work_context>
-git fetch origin
-git checkout <branch_name from get_work_context>
-git pull origin <branch_name>
+git clone <clone_url from get_work_context> my-ticket-workspace
+cd my-ticket-workspace
+git checkout -B <branch_name from get_work_context> origin/<branch_name>
 ```
 
 Now read the `description` and `acceptance_criteria` before writing any code.
+
+> If `clone_url` came back without credentials (your Marcus sets
+> `MARCUS_EMBED_GIT_CREDENTIALS=false`), configure a git credential helper or
+> `~/.netrc` for your Gitea host once, then clone the plain URL.
 
 ---
 

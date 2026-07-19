@@ -289,6 +289,13 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
 </style>
 
 <div class="sidebar-collapse">
+    <h2 class="sidebar-title"><?= t('Marcus Code') ?></h2>
+    <div id="marcus-branch-link" style="font-size:12px;color:#888;">
+        <?= t('Loading') ?>&hellip;
+    </div>
+</div>
+
+<div class="sidebar-collapse">
     <h2 class="sidebar-title"><?= t('Marcus Dependencies') ?></h2>
     <div id="marcus-deps-loading" style="font-size:12px;color:#888;">Loading&hellip;</div>
     <div id="marcus-deps-content" style="display:none;">
@@ -560,6 +567,25 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         });
     }
 
+    var branchEl = document.getElementById('marcus-branch-link');
+
+    function renderBranchLink(data) {
+        if (!branchEl) { return; }
+        if (data && data.branch_web_url) {
+            // textContent + href assignment (never innerHTML with the URL) so
+            // a crafted repo/branch name can't inject markup into the sidebar.
+            var a = document.createElement('a');
+            a.href = data.branch_web_url;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.textContent = '\u{1F517} ' + 'View this ticket’s branch in Gitea';
+            branchEl.textContent = '';
+            branchEl.appendChild(a);
+        } else {
+            branchEl.textContent = 'No Gitea branch yet for this ticket.';
+        }
+    }
+
     fetch(LINKS_URL, { cache: 'no-store', headers: marcusHeaders() })
         .then(function (r) { return r.json(); })
         .then(function (data) {
@@ -568,11 +594,13 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
             renderList(onList,      data.depends_on,  'No dependencies');
             renderList(blocksList,  data.blocks,       'Blocks nothing');
             renderList(relList,     data.relates_to,   'No related tickets');
+            renderBranchLink(data);
         })
         .catch(function () {
             loadingEl.style.display = 'none';
             errorEl.style.display   = 'block';
             errorEl.textContent     = 'Could not reach Marcus at ' + LINKS_URL;
+            if (branchEl) { branchEl.textContent = 'Could not reach Marcus.'; }
         });
 }());
 </script>

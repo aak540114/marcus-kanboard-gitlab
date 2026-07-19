@@ -1298,6 +1298,63 @@ class TestAgentGitUrls:
         assert "git clone" in ctx["instructions"]
 
 
+class TestRepoLinksForKanboardUI:
+    """get_repo_links / get_project_repo_url feed the Kanboard UI links."""
+
+    def _wire(self, workflow, mock_kanban, mapping=True):
+        task = MagicMock()
+        task.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+        gitea = MagicMock()
+        gitea._username = "root"
+        gitea._token = "adminTok"
+        ps = MagicMock()
+        ps._gitea = gitea
+        ps.get_repo_for_project = MagicMock(
+            return_value=(
+                {"gitea_repo_url": "http://gitea:3000/root/app.git"}
+                if mapping
+                else None
+            )
+        )
+        workflow._project_sync = ps
+
+    @pytest.mark.asyncio
+    async def test_get_repo_links_returns_credential_free_urls(
+        self, workflow, lifecycle, mock_kanban, monkeypatch
+    ):
+        """Repo + branch links are browser-facing and carry NO credentials."""
+        monkeypatch.delenv("GITEA_PUBLIC_URL", raising=False)
+        lifecycle.get_or_create("70", "kanboard", branch_name="ticket/kanboard/70")
+        self._wire(workflow, mock_kanban)
+
+        links = await workflow.get_repo_links("70")
+        assert links == {
+            "repo_web_url": "http://localhost:3000/root/app",
+            "branch_web_url": "http://localhost:3000/root/app/src/branch/ticket/kanboard/70",
+        }
+        assert "@" not in links["branch_web_url"]  # no embedded creds
+
+    @pytest.mark.asyncio
+    async def test_get_repo_links_none_when_repo_not_provisioned(
+        self, workflow, mock_kanban
+    ):
+        """No mapping yet → None (and no provisioning side effect)."""
+        self._wire(workflow, mock_kanban, mapping=False)
+        assert await workflow.get_repo_links("71") is None
+        # Non-provisioning: read-only lookup, ensure_repo never called.
+        workflow._project_sync.get_repo_for_project.assert_called()
+
+    def test_get_project_repo_url(self, workflow, mock_kanban, monkeypatch):
+        """Project repo URL is the browser repo link, or None if unprovisioned."""
+        monkeypatch.delenv("GITEA_PUBLIC_URL", raising=False)
+        self._wire(workflow, mock_kanban)
+        assert workflow.get_project_repo_url(3) == "http://localhost:3000/root/app"
+
+        self._wire(workflow, mock_kanban, mapping=False)
+        assert workflow.get_project_repo_url(3) is None
+
+
 # ---------------------------------------------------------------------------
 # get_work_context: enriched ticket data (priority/labels/due_date/
 # estimated_hours/links/recent_comments)

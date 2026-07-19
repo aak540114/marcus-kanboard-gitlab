@@ -36,6 +36,7 @@ $descUrl          = $marcusUrl . '/project-description?project_id=' . urlencode(
                   . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
 $gateApiBase      = $marcusUrl . '/api/gate-setting';
 $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
+$projectRepoUrl   = $marcusUrl . '/api/project-repo?project_id=' . urlencode((string) $projectId);
 ?>
 <style>
 /* ── Active agents badge ──────────────────────────────────────────────── */
@@ -189,6 +190,14 @@ $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
         &#128196; Project Description
     </a>
 
+    <!-- Gitea repository link (shown once the repo is provisioned) -->
+    <a id="marcus-repo-link" href="#" target="_blank" rel="noopener noreferrer"
+       style="display:none;align-items:center;gap:5px;padding:4px 10px;border-radius:12px;
+              font-size:12px;font-weight:600;text-decoration:none;
+              background:#f0fdf4;color:#15803d;border:1px solid #bbf7d0;">
+        &#128193; Repository
+    </a>
+
     <!-- Project-level gate toggle -->
     <div class="marcus-gate-wrap">
         <span class="marcus-gate-label">Project gate:</span>
@@ -237,6 +246,7 @@ $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
     var AGENTS_URL       = <?= json_encode($apiUrl) ?>;
     var GATE_URL         = <?= json_encode($gateApiBase) ?>;
     var DEV_ENV_SETTING_URL = <?= json_encode($devEnvSettingUrl) ?>;
+    var PROJECT_REPO_URL = <?= json_encode($projectRepoUrl) ?>;
     var PROJECT_ID       = <?= json_encode((int) $projectId) ?>;
     var MARCUS_TOKEN     = <?= json_encode($marcusToken) ?>;
     var INTERVAL         = 15000;
@@ -248,6 +258,24 @@ $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
         if (MARCUS_TOKEN) { h['Authorization'] = 'Bearer ' + MARCUS_TOKEN; }
         return h;
     }
+
+    /* ── Gitea repository link ───────────────────────────────────────── */
+    // Reveal the "Repository" button only once the project's repo exists
+    // (repo_web_url is null until provisioned). href assignment (not
+    // innerHTML) keeps a crafted repo name from injecting markup.
+    (function () {
+        var repoLink = document.getElementById('marcus-repo-link');
+        if (!repoLink) { return; }
+        fetch(PROJECT_REPO_URL, { cache: 'no-store', headers: marcusHeaders() })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data && data.repo_web_url) {
+                    repoLink.href = data.repo_web_url;
+                    repoLink.style.display = 'inline-flex';
+                }
+            })
+            .catch(function () { /* leave hidden on error */ });
+    }());
 
     /* ── Active agents badge ─────────────────────────────────────────── */
     var badge   = document.getElementById('marcus-agent-badge');
