@@ -76,6 +76,35 @@ from src.marcus_mcp.tool_groups import get_tools_for_endpoint  # noqa: E402
 from src.monitoring.assignment_monitor import AssignmentMonitor  # noqa: E402
 
 
+def _board_activity_fingerprint(tasks: List[Dict[str, Any]]) -> str:
+    """Return a version string that changes when the board visibly changes.
+
+    Built from each task's ``(id, column_id, date_modification)`` — moving a
+    card (column change) and any task edit both bump ``date_modification``,
+    so the fingerprint changes exactly when the board's rendered state does.
+    Order-independent (sorted) so it's stable across query orderings.
+
+    Parameters
+    ----------
+    tasks : List[Dict[str, Any]]
+        Raw Kanboard task dicts (from ``getAllTasks``).
+
+    Returns
+    -------
+    str
+        A short hex digest; empty-string input yields a stable digest too.
+    """
+    import hashlib
+
+    parts = sorted(
+        f"{t.get('id')}:{t.get('column_id')}:{t.get('date_modification')}"
+        for t in tasks
+    )
+    return hashlib.sha1(  # noqa: S324 - non-security change-detection hash
+        "|".join(parts).encode("utf-8")
+    ).hexdigest()
+
+
 def _carry_forward_active_subtasks(
     project_tasks: Optional[List[Task]], parent_ids: Set[str]
 ) -> Tuple[List[Task], int]:
@@ -4744,6 +4773,162 @@ function save() {{
                 )
             )
 
+        def _kb_rpc_target() -> tuple[str, str]:
+            """Return (jsonrpc_url, api_token) for direct Kanboard RPC calls."""
+            url = os.getenv("KANBOARD_URL", "http://localhost:8080/jsonrpc.php")
+            if not url.endswith("/jsonrpc.php"):
+                url = url.rstrip("/") + "/jsonrpc.php"
+            return url, os.getenv("KANBOARD_API_TOKEN", "")
+
+        async def board_activity(request: Request) -> JSONResponse:
+            """Return a change fingerprint for a project's board.
+
+            The MarcusDevEnv plugin polls this and reloads the page only when
+            the ``version`` changes — so agent/Marcus column moves and edits
+            show up without a manual refresh, with no reload when nothing
+            changed.
+
+            Query params: ``project_id`` (required, numeric).
+            Response: ``{"project_id": "<str>", "version": "<hex>"}``.
+            """
+            import httpx as _httpx
+
+            def _cors(r: JSONResponse) -> JSONResponse:
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                r.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+                return r
+
+            project_id = request.query_params.get("project_id", "").strip()
+            if not project_id:
+                return _cors(
+                    JSONResponse({"error": "project_id required"}, status_code=400)
+                )
+            try:
+                pid = int(project_id)
+            except ValueError:
+                return _cors(
+                    JSONResponse({"error": "project_id must be numeric"}, status_code=400)
+                )
+
+            kb_url, kb_token = _kb_rpc_target()
+            version = ""
+            if kb_token:
+                try:
+                    async with _httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.post(
+                            kb_url,
+                            json={
+                                "jsonrpc": "2.0",
+                                "method": "getAllTasks",
+                                "id": 1,
+                                "params": {"project_id": pid, "status_id": 1},
+                            },
+                            auth=_httpx.BasicAuth("jsonrpc", kb_token),
+                        )
+                        resp.raise_for_status()
+                        tasks = resp.json().get("result") or []
+                    version = _board_activity_fingerprint(tasks)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("board_activity: Kanboard call failed: %s", exc)
+            return _cors(
+                JSONResponse({"project_id": project_id, "version": version})
+            )
+
+        async def ticket_activity(request: Request) -> JSONResponse:
+            """Return a change fingerprint for a single ticket.
+
+            Detects new comments (via ``getAllComments`` count), column moves,
+            and lifecycle-state changes, so the task detail view refreshes when
+            Marcus/agents post a comment or move the card.
+
+            Query params: ``ticket_id`` (required, numeric).
+            Response: ``{"ticket_id": "<str>", "comment_count": <int>,
+            "version": "<str>"}``.
+            """
+            import httpx as _httpx
+
+            def _cors(r: JSONResponse) -> JSONResponse:
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                r.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+                return r
+
+            ticket_id = request.query_params.get("ticket_id", "").strip()
+            if not ticket_id:
+                return _cors(
+                    JSONResponse({"error": "ticket_id required"}, status_code=400)
+                )
+            try:
+                tid = int(ticket_id)
+            except ValueError:
+                return _cors(
+                    JSONResponse({"error": "ticket_id must be numeric"}, status_code=400)
+                )
+
+            kb_url, kb_token = _kb_rpc_target()
+            comment_count = 0
+            column_id = ""
+            date_modification = ""
+            if kb_token:
+                try:
+                    async with _httpx.AsyncClient(timeout=5.0) as client:
+                        cr = await client.post(
+                            kb_url,
+                            json={
+                                "jsonrpc": "2.0",
+                                "method": "getAllComments",
+                                "id": 1,
+                                "params": {"task_id": tid},
+                            },
+                            auth=_httpx.BasicAuth("jsonrpc", kb_token),
+                        )
+                        cr.raise_for_status()
+                        comment_count = len(cr.json().get("result") or [])
+                        tr = await client.post(
+                            kb_url,
+                            json={
+                                "jsonrpc": "2.0",
+                                "method": "getTask",
+                                "id": 2,
+                                "params": {"task_id": tid},
+                            },
+                            auth=_httpx.BasicAuth("jsonrpc", kb_token),
+                        )
+                        tr.raise_for_status()
+                        task = tr.json().get("result") or {}
+                        column_id = str(task.get("column_id", ""))
+                        date_modification = str(task.get("date_modification", ""))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("ticket_activity: Kanboard call failed: %s", exc)
+
+            # Lifecycle state (Marcus-side) rounds out the signal — a state
+            # transition with no board change still refreshes the panels.
+            state = ""
+            try:
+                from src.core.ticket_lifecycle import TicketLifecycleManager
+
+                lm = getattr(server, "_lifecycle_manager_cache", None)
+                if lm is None:
+                    lm = TicketLifecycleManager()
+                    server._lifecycle_manager_cache = lm  # type: ignore[attr-defined]
+                else:
+                    lm._load()
+                rec = lm.get(ticket_id, server.provider)
+                if rec is not None:
+                    state = rec.state.value
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("ticket_activity: lifecycle read failed: %s", exc)
+
+            version = f"{comment_count}:{column_id}:{date_modification}:{state}"
+            return _cors(
+                JSONResponse(
+                    {
+                        "ticket_id": ticket_id,
+                        "comment_count": comment_count,
+                        "version": version,
+                    }
+                )
+            )
+
         mcp_app = fastmcp.streamable_http_app()
 
         @contextlib.asynccontextmanager
@@ -4813,6 +4998,8 @@ function save() {{
                 Route("/api/active-agents", active_agents, methods=["GET"]),
                 Route("/api/ticket-links", ticket_links, methods=["GET"]),
                 Route("/api/project-repo", project_repo, methods=["GET"]),
+                Route("/api/board-activity", board_activity, methods=["GET"]),
+                Route("/api/ticket-activity", ticket_activity, methods=["GET"]),
                 Route("/project-description", project_description_page, methods=["GET"]),
                 Route("/api/project-description", project_description_api, methods=["GET", "PUT"]),
                 Route("/api/gate-setting", gate_setting_api, methods=["GET"]),

@@ -57,6 +57,10 @@ $linksUrl = $marcusUrl
     . '/api/ticket-links'
     . '?ticket_id=' . urlencode((string) $ticketId);
 
+$activityUrl = $marcusUrl
+    . '/api/ticket-activity'
+    . '?ticket_id=' . urlencode((string) $ticketId);
+
 $gateApiBase = $marcusUrl . '/api/gate-setting';
 ?>
 
@@ -326,6 +330,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
     var STOP_URL     = <?= json_encode($stopUrl) ?>;
     var STATUS_URL   = <?= json_encode($statusUrl) ?>;
     var LINKS_URL    = <?= json_encode($linksUrl) ?>;
+    var ACTIVITY_URL = <?= json_encode($activityUrl) ?>;
     var GATE_URL     = <?= json_encode($gateApiBase) ?>;
     var TICKET_ID    = <?= json_encode((string) $ticketId) ?>;
     var PROJECT_ID   = <?= json_encode((int) $projectId) ?>;
@@ -338,6 +343,41 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         if (MARCUS_TOKEN) { h['Authorization'] = 'Bearer ' + MARCUS_TOKEN; }
         return h;
     }
+
+    /* ── Live task refresh ───────────────────────────────────────────── */
+    // Poll Marcus for a ticket fingerprint (comment count + column + state);
+    // when it changes — an agent/Marcus posted a comment or moved the card —
+    // reload so it appears without a manual refresh. Never reloads while
+    // you're typing (e.g. writing a comment) or a Kanboard form is open.
+    (function () {
+        if (!ACTIVITY_URL) { return; }
+        var baseline = null;
+
+        function userIsBusy() {
+            var el = document.activeElement;
+            if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT'
+                       || el.isContentEditable)) { return true; }
+            if (document.querySelector('#popover-container, .modal-box')) {
+                return true;
+            }
+            return false;
+        }
+
+        function poll() {
+            fetch(ACTIVITY_URL, { cache: 'no-store', headers: marcusHeaders() })
+                .then(function (r) { return r.json(); })
+                .then(function (d) {
+                    if (!d || !d.version) { return; }
+                    if (baseline === null) { baseline = d.version; return; }
+                    if (d.version !== baseline && !userIsBusy()) {
+                        window.location.reload();
+                    }
+                })
+                .catch(function () { /* transient — retry next tick */ });
+        }
+        setInterval(poll, 7000);
+        poll();
+    }());
 
     /* ── Dev-environment panel ───────────────────────────────────── */
     var devPanel  = document.getElementById('marcus-dev-env-panel');

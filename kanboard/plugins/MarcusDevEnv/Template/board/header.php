@@ -37,6 +37,7 @@ $descUrl          = $marcusUrl . '/project-description?project_id=' . urlencode(
 $gateApiBase      = $marcusUrl . '/api/gate-setting';
 $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
 $projectRepoUrl   = $marcusUrl . '/api/project-repo?project_id=' . urlencode((string) $projectId);
+$boardActivityUrl = $marcusUrl . '/api/board-activity?project_id=' . urlencode((string) $projectId);
 ?>
 <style>
 /* ── Active agents badge ──────────────────────────────────────────────── */
@@ -247,6 +248,7 @@ $projectRepoUrl   = $marcusUrl . '/api/project-repo?project_id=' . urlencode((st
     var GATE_URL         = <?= json_encode($gateApiBase) ?>;
     var DEV_ENV_SETTING_URL = <?= json_encode($devEnvSettingUrl) ?>;
     var PROJECT_REPO_URL = <?= json_encode($projectRepoUrl) ?>;
+    var BOARD_ACTIVITY_URL = <?= json_encode($boardActivityUrl) ?>;
     var PROJECT_ID       = <?= json_encode((int) $projectId) ?>;
     var MARCUS_TOKEN     = <?= json_encode($marcusToken) ?>;
     var INTERVAL         = 15000;
@@ -258,6 +260,42 @@ $projectRepoUrl   = $marcusUrl . '/api/project-repo?project_id=' . urlencode((st
         if (MARCUS_TOKEN) { h['Authorization'] = 'Bearer ' + MARCUS_TOKEN; }
         return h;
     }
+
+    /* ── Live board refresh ──────────────────────────────────────────── */
+    // Poll Marcus for a board fingerprint; when it changes (an agent/Marcus
+    // moved a card or edited a task), reload the page so the change appears
+    // without a manual refresh. Never reloads while you're typing (e.g.
+    // writing a comment) or while a Kanboard popover/form is open.
+    (function () {
+        if (!BOARD_ACTIVITY_URL || !PROJECT_ID) { return; }
+        var baseline = null;
+
+        function userIsBusy() {
+            var el = document.activeElement;
+            if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT'
+                       || el.isContentEditable)) { return true; }
+            // A Kanboard modal/popover open → don't yank it out from under.
+            if (document.querySelector('#popover-container, .modal-box')) {
+                return true;
+            }
+            return false;
+        }
+
+        function poll() {
+            fetch(BOARD_ACTIVITY_URL, { cache: 'no-store', headers: marcusHeaders() })
+                .then(function (r) { return r.json(); })
+                .then(function (d) {
+                    if (!d || !d.version) { return; }
+                    if (baseline === null) { baseline = d.version; return; }
+                    if (d.version !== baseline && !userIsBusy()) {
+                        window.location.reload();
+                    }
+                })
+                .catch(function () { /* transient — try again next tick */ });
+        }
+        setInterval(poll, 7000);
+        poll();
+    }());
 
     /* ── Gitea repository link ───────────────────────────────────────── */
     // Reveal the "Repository" button only once the project's repo exists
