@@ -2485,6 +2485,79 @@ class TestReviewFixes:
         assert "80" not in {r.ticket_id for r in lifecycle.get_available_tickets()}
 
     @pytest.mark.asyncio
+    async def test_drag_to_done_column_merges(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """A status_changed to 'done' triggers the merge (not just close)."""
+        lifecycle.get_or_create("30", "kanboard")
+        lifecycle.transition("30", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("30", "kanboard", workflow._agent_id)
+        lifecycle.transition("30", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("30", "kanboard", TicketState.WAITING_FOR_HUMAN)
+        lifecycle.set_assignee("30", "kanboard", "alice")
+
+        event = _make_event(
+            {"ticket_id": "30", "new_status": "done", "provider": "kanboard"}
+        )
+        await workflow._on_status_changed(event)
+
+        mock_branch.merge_to_main.assert_awaited()
+        assert lifecycle.get("30", "kanboard").state == TicketState.DONE
+
+    @pytest.mark.asyncio
+    async def test_approve_comment_merges(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """A human "approve" comment on a waiting ticket merges to main."""
+        lifecycle.get_or_create("31", "kanboard")
+        lifecycle.transition("31", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("31", "kanboard", workflow._agent_id)
+        lifecycle.transition("31", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("31", "kanboard", TicketState.WAITING_FOR_HUMAN)
+        lifecycle.set_assignee("31", "kanboard", "alice")
+
+        event = _make_event(
+            {"ticket_id": "31", "comment_body": "approved. merge to main",
+             "comment_author": "alice", "provider": "kanboard"}
+        )
+        await workflow._on_comment_added(event)
+
+        mock_branch.merge_to_main.assert_awaited()
+        assert lifecycle.get("31", "kanboard").state == TicketState.DONE
+
+    def test_is_approval_comment_recognizes_and_rejects(self, workflow):
+        """Approval matcher: accepts approvals, rejects negated/conditional."""
+        assert workflow._is_approval_comment("approved. merge to main") is True
+        assert workflow._is_approval_comment("LGTM") is True
+        assert workflow._is_approval_comment("@marcus approve") is True
+        assert workflow._is_approval_comment("looks good, ship it") is True
+        # Negated / conditional must NOT be treated as approval.
+        assert workflow._is_approval_comment("don't merge yet") is False
+        assert workflow._is_approval_comment("approve after you fix the test") is False
+        assert workflow._is_approval_comment("please change the button color") is False
+
+    @pytest.mark.asyncio
+    async def test_non_approval_comment_still_requests_changes(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """A normal comment on a waiting ticket resumes the agent (no merge)."""
+        lifecycle.get_or_create("32", "kanboard")
+        lifecycle.transition("32", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("32", "kanboard", workflow._agent_id)
+        lifecycle.transition("32", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("32", "kanboard", TicketState.WAITING_FOR_HUMAN)
+        lifecycle.set_assignee("32", "kanboard", "alice")
+
+        event = _make_event(
+            {"ticket_id": "32", "comment_body": "change the button to blue",
+             "comment_author": "alice", "provider": "kanboard"}
+        )
+        await workflow._on_comment_added(event)
+
+        mock_branch.merge_to_main.assert_not_awaited()
+        assert lifecycle.get("32", "kanboard").state == TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
     async def test_pickup_ignores_foreign_provider_records(
         self, workflow, lifecycle, mock_kanban
     ):

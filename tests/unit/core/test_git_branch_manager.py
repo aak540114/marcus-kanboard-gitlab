@@ -79,3 +79,48 @@ class TestMergeToMainAbortsOnFailure:
 
         assert ok is True
         assert ("merge", "--abort") not in _calls(mgr._git)
+
+
+class TestMergeFetchesAgentBranch:
+    """merge_to_main must merge the AGENT's pushed commits, not the stale
+    local branch. With the self-clone design the agent's work lives on the
+    remote branch; this clone's local ticket branch is empty."""
+
+    @pytest.mark.asyncio
+    async def test_fetches_branch_and_merges_fetch_head(self):
+        """A successful fetch → merge FETCH_HEAD (the remote agent commits)."""
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+
+        ok = await mgr.merge_to_main("ticket/kanboard/3", delete_after=False)
+
+        assert ok is True
+        calls = _calls(mgr._git)
+        # Fetched the ticket branch before merging.
+        assert any(
+            c[0] == "fetch" and "ticket/kanboard/3" in c for c in calls
+        )
+        # Merged the fetched remote tip, not the stale local branch.
+        assert any(
+            c[0] == "merge" and "FETCH_HEAD" in c for c in calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_local_branch_when_remote_absent(self):
+        """If the remote branch can't be fetched, merge the local ref."""
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/3":
+                return (1, "", "couldn't find remote ref")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.merge_to_main("ticket/kanboard/3", delete_after=False)
+
+        assert ok is True
+        assert any(
+            c[0] == "merge" and "ticket/kanboard/3" in c
+            for c in _calls(mgr._git)
+        )

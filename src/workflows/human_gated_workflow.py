@@ -364,7 +364,9 @@ class HumanGatedWorkflow:
         * ``waiting_for_human`` moved by human → rejected with a warning
           (that state is AI-only; only AI may set it).
         * ``todo`` / ``blocked`` → update lifecycle state accordingly.
-        * ``done`` is handled by the ``ticket.closed`` event; no action here.
+        * ``done`` → drive :meth:`_on_ticket_closed` (merge to main). A
+          Done-column move is a column move, not a Kanboard task-close, so
+          the merge must be triggered here too.
         """
         data = event.data
         ticket_id = data["ticket_id"]
@@ -480,6 +482,17 @@ class HumanGatedWorkflow:
             except (InvalidTransitionError, KeyError):
                 pass
 
+        elif new_status == TaskStatus.DONE.value:
+            # Human dragged the card to the Done column. Kanboard fires this
+            # as a column move (task.move.column), NOT task.close — so the
+            # ticket.closed handler that merges the branch never runs on its
+            # own (moving to the last column does not close a Kanboard task
+            # by default). Drive that handler here so "drag to Done" actually
+            # merges. Idempotent: _on_ticket_closed's own state guard skips an
+            # already-DONE record, so the poll echo of this same move is a
+            # no-op.
+            await self._on_ticket_closed(event)
+
     async def _on_ticket_closed(self, event: Any) -> None:
         """Handle a ticket marked done — merge branch to main."""
         data = event.data
@@ -524,6 +537,33 @@ class HumanGatedWorkflow:
         ):
             return
 
+        await self._merge_ticket_to_main(ticket_id, record)
+
+    async def _merge_ticket_to_main(
+        self, ticket_id: str, record: TicketRecord
+    ) -> bool:
+        """Merge a ticket's branch to main and complete it.
+
+        Shared by the "human dragged the card to Done" path
+        (:meth:`_on_ticket_closed`) and the "``@marcus approve`` comment"
+        path (:meth:`_on_comment_added`). On success: transitions the record
+        to DONE, releases the claim, stops the dev env, posts a "Merged"
+        comment, unblocks dependents, and picks up the next ticket. On merge
+        failure: posts an error, parks the ticket in WAITING_FOR_HUMAN, and
+        frees the slot.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        record : TicketRecord
+            Current lifecycle record (for branch name / assignee).
+
+        Returns
+        -------
+        bool
+            ``True`` if the branch merged and the ticket completed.
+        """
         branch_name = record.branch_name
         branch_mgr = await self._branch_for_ticket(ticket_id)
         main_branch = branch_mgr.config.main_branch
@@ -587,6 +627,7 @@ class HumanGatedWorkflow:
 
             # Agent is now free — pick up the next ticket in dependency order.
             await self._pickup_next_ticket()
+            return True
         else:
             await self._post_error(
                 ticket_id,
@@ -613,6 +654,7 @@ class HumanGatedWorkflow:
                     exc,
                 )
             await self._pickup_next_ticket()
+            return False
 
     async def _on_ticket_reopened(self, event: Any) -> None:
         """Handle a ticket being reopened — rebase branch on main and resume."""
@@ -687,6 +729,32 @@ class HumanGatedWorkflow:
         # Check for @marcus commands.
         if CommentParser.contains_command(body, "start-dev-env"):
             await self._handle_start_dev_env_command(ticket_id, record)
+            return
+
+        # Approval by comment: on a ticket awaiting review, "@marcus approve"
+        # (or a plain "approve" / "lgtm" / "merge to main") means the same as
+        # dragging the card to Done — merge the branch to main. This must be
+        # checked BEFORE the generic "any comment = please make changes" path
+        # below, or an approval would be misread as a revision request.
+        if (
+            record.state == TicketState.WAITING_FOR_HUMAN
+            and self._is_approval_comment(body)
+        ):
+            logger.info(
+                "Approval comment on ticket %s by %s — merging to main",
+                ticket_id,
+                author,
+            )
+            merged = await self._merge_ticket_to_main(ticket_id, record)
+            if merged:
+                try:
+                    await self._kanban.move_task_to_column(ticket_id, "done")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Could not move %s to done after approval: %s",
+                        ticket_id,
+                        exc,
+                    )
             return
 
         # If AI is waiting for human, treat any comment as a continuation
@@ -2179,6 +2247,54 @@ class HumanGatedWorkflow:
         if base:
             return f"{base}/mcp"
         return "http://localhost:4298/mcp"
+
+    @staticmethod
+    def _is_approval_comment(body: str) -> bool:
+        """Return ``True`` if a human comment means "approve and merge".
+
+        Recognizes the explicit ``@marcus approve`` / ``@marcus merge``
+        command, and plain natural approvals (``approve``, ``approved``,
+        ``lgtm``, ``ship it``, ``merge``, ``looks good``) — but never when
+        the comment is negated or conditional (``don't merge``, ``approve
+        after you fix…``), so a nuanced review isn't mistaken for a blanket
+        approval.
+
+        Parameters
+        ----------
+        body : str
+            The human comment text.
+
+        Returns
+        -------
+        bool
+            ``True`` if the comment is an unconditional approval.
+        """
+        text = body.strip().lower()
+        if not text:
+            return False
+        if CommentParser.contains_command(body, "approve") or (
+            CommentParser.contains_command(body, "merge")
+        ):
+            return True
+        # Never treat a negated / conditional comment as approval.
+        negations = (
+            "don't", "do not", "not ", "n't", " after ", " once ",
+            "unless", " but ", "wait", "hold", "before",
+        )
+        if any(neg in text for neg in negations):
+            return False
+        approvals = (
+            "approve",
+            "approved",
+            "lgtm",
+            "ship it",
+            "merge",
+            "looks good",
+            "looks great",
+            "good to merge",
+            "good to go",
+        )
+        return text.startswith(approvals)
 
     def _is_unassigned(self, record: TicketRecord) -> bool:
         """Return ``True`` if no human is assigned to *record*.

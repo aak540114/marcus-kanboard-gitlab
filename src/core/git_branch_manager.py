@@ -268,12 +268,32 @@ class BranchManager:
             await self._git("merge", "--abort")
             return False
 
+        # Fetch the ticket branch from the remote before merging. The coding
+        # agent works in its OWN clone (it self-clones — see get_work_context)
+        # and pushes commits to the REMOTE branch; this clone's local
+        # ``branch_name`` is the empty branch Marcus created at start time and
+        # has NONE of the agent's work. Merging it would land nothing on main
+        # ("dragged to Done but nothing merged"). Merge the fetched remote tip
+        # instead; fall back to the local branch only if the remote ref is
+        # genuinely absent (offline, or a local-only test flow).
+        merge_ref = branch_name
+        rc, _, err = await self._git("fetch", self.config.remote, branch_name)
+        if rc == 0:
+            merge_ref = "FETCH_HEAD"
+        else:
+            logger.warning(
+                "Could not fetch %s/%s before merge; merging local ref: %s",
+                self.config.remote,
+                branch_name,
+                err,
+            )
+
         # Merge. On failure, ALWAYS abort: a conflicted merge leaves
         # MERGE_HEAD and a conflicted index in this shared working tree,
         # and every subsequent git operation for every other ticket then
         # fails with "you have not concluded your merge" until someone
         # manually aborts. Mirrors the abort rebase_on_main already does.
-        rc, _, err = await self._git("merge", "--no-ff", branch_name, "-m", msg)
+        rc, _, err = await self._git("merge", "--no-ff", merge_ref, "-m", msg)
         if rc != 0:
             logger.error("Merge failed for %s → %s: %s", branch_name, main, err)
             await self._git("merge", "--abort")
@@ -376,10 +396,15 @@ class BranchManager:
         """
         base = base_branch or self.config.main_branch
         await self._git("fetch", self.config.remote, base)
-        # Use the remote-tracking ref so the diff reflects the freshly fetched state,
-        # not the potentially stale local branch.
+        # Also fetch the ticket branch: the agent's commits live on the
+        # REMOTE branch (it self-clones), not this clone's stale local branch.
+        # Diff the fetched remote tip so AI Verify sees the agent's real work.
+        branch_ref = branch_name
+        rc, _, _ = await self._git("fetch", self.config.remote, branch_name)
+        if rc == 0:
+            branch_ref = "FETCH_HEAD"
         remote_base = f"{self.config.remote}/{base}"
-        _, stdout, _ = await self._git("diff", f"{remote_base}...{branch_name}")
+        _, stdout, _ = await self._git("diff", f"{remote_base}...{branch_ref}")
         return stdout
 
     async def get_branch_commits(
@@ -400,7 +425,13 @@ class BranchManager:
             List of commit summary strings (``{hash} {message}``).
         """
         base = base_branch or self.config.main_branch
-        _, stdout, _ = await self._git("log", "--oneline", f"{base}..{branch_name}")
+        # Fetch the ticket branch so the commit list reflects the agent's
+        # pushed work (its commits are on the remote, not this local clone).
+        branch_ref = branch_name
+        rc, _, _ = await self._git("fetch", self.config.remote, branch_name)
+        if rc == 0:
+            branch_ref = "FETCH_HEAD"
+        _, stdout, _ = await self._git("log", "--oneline", f"{base}..{branch_ref}")
         lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
         return lines
 
