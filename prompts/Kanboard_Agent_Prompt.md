@@ -23,8 +23,9 @@ tool, `marcus_work`, and do exactly what it tells you. After connecting the
 > resolve, call with `report="BLOCKED - <reason>"`. Repeat until `marcus_work`
 > says there's no more work.
 
-Marcus only hands out tickets **you (the human) have assigned to yourself and
-moved to Ready** — that's the trigger. It summarizes each of your reports onto
+Marcus only hands out tickets that are **assigned to a human (anyone — not
+necessarily you) and moved to Ready** — that's the trigger. It summarizes each
+of the worker's reports onto
 the ticket as a comment, and completes the ticket through the project's gate
 (human review, or auto-merge) when you report `DONE`. You never need to know
 any other tool. The rest of this document (§1 onward) is the manual for the

@@ -2623,6 +2623,23 @@ class TestOrchestrateWork:
         assert lifecycle.get("5", "kanboard").assignee == "alice"
 
     @pytest.mark.asyncio
+    async def test_ticket_assigned_to_anyone_is_handed_out(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Assigned to ANY human (not necessarily the requester) → handed out."""
+        lifecycle.get_or_create("15", "kanboard")
+        lifecycle.transition("15", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("15", "kanboard", "bob")  # some other human
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            res = await workflow.orchestrate_work(agent_id="worker-xyz")
+        assert res["status"] == "assigned"
+        assert res["ticket_id"] == "15"
+        assert lifecycle.get("15", "kanboard").assignee == "bob"  # owner unchanged
+
+    @pytest.mark.asyncio
     async def test_unassigned_ready_ticket_is_not_handed_out(
         self, workflow, lifecycle, mock_kanban
     ):

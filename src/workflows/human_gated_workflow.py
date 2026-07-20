@@ -1114,11 +1114,13 @@ class HumanGatedWorkflow:
     def _next_worker_ticket(self) -> Optional[str]:
         """Return the next human-readied ticket to hand a worker, or ``None``.
 
-        HUMAN-TRIGGERED selection: Marcus only hands out tickets a human has
-        **assigned to themselves AND moved to Ready** (the existing gate).
-        A ticket is workable when it is READY/IN_PROGRESS, has a human owner,
-        and is not already held by a worker (an internal ``marcus-`` slot
-        claim from the human-gated auto-start is fine — the worker adopts it).
+        HUMAN-TRIGGERED selection: Marcus only hands out tickets that are
+        **assigned to a human — ANYONE, not necessarily you — AND moved to
+        Ready** (the existing gate). A ticket is workable when it is
+        READY/IN_PROGRESS, has any human owner (assignee set and not the
+        Kanboard "0" no-owner sentinel), and is not already held by a worker
+        (an internal ``marcus-`` slot claim from the human-gated auto-start is
+        fine — the worker adopts it).
         """
         def _key(rec: TicketRecord) -> int:
             try:
