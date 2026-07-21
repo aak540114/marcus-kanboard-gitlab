@@ -99,7 +99,11 @@ class AISettings:
     cloud_url: Optional[str] = None
     claude_cli_model: Optional[str] = None
     model: Optional[str] = "claude-3-haiku-20240307"
-    temperature: float = 0.7
+    # Low by default: Marcus's LLM work is overwhelmingly structured
+    # (decomposition, dependency inference, JSON) where deterministic,
+    # parseable output matters more than variety. The one free-form path
+    # (AIAnalysisEngine.generate_text) opts into a higher value explicitly.
+    temperature: float = 0.1
     max_tokens: int = 4096
     enabled: bool = True
 

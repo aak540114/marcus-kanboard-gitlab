@@ -817,10 +817,13 @@ Write unit tests for auth flow
         result = await ai_engine._call_claude("test prompt")
 
         assert result == "AI response"
+        # The structured/JSON path uses the engine's LOW configured
+        # temperature for deterministic, parseable output — NOT the higher
+        # prose temperature.
         ai_engine.client.messages.create.assert_awaited_once_with(
             model=ai_engine.model,
             max_tokens=2000,
-            temperature=0.7,
+            temperature=ai_engine.temperature,
             messages=[{"role": "user", "content": "test prompt"}],
         )
 
@@ -1406,3 +1409,31 @@ class TestGenerateTextRawOutput:
         )
         result = await ai_engine._call_claude("give me json")
         assert result == '{"key": "value"}'
+
+    @pytest.mark.asyncio
+    async def test_generate_text_uses_higher_prose_temperature(self, ai_engine):
+        """generate_text opts into a higher temperature than the structured
+        default, so prose reads less robotically."""
+        from src.integrations.ai_analysis_engine import _PROSE_TEMPERATURE
+
+        ai_engine._complete_raw = AsyncMock(return_value="some prose")
+
+        await ai_engine.generate_text("write a summary")
+
+        ai_engine._complete_raw.assert_awaited_once_with(
+            "write a summary", temperature=_PROSE_TEMPERATURE
+        )
+        assert _PROSE_TEMPERATURE > ai_engine.temperature
+
+    @pytest.mark.asyncio
+    async def test_call_claude_uses_low_structured_temperature(self, ai_engine):
+        """_call_claude routes through _complete_raw with no temperature
+        override, so it inherits the engine's LOW configured temperature."""
+        ai_engine._complete_raw = AsyncMock(return_value='{"ok": true}')
+
+        await ai_engine._call_claude("give me json")
+
+        # No explicit temperature kwarg → _complete_raw applies self.temperature.
+        args, kwargs = ai_engine._complete_raw.await_args
+        assert "temperature" not in kwargs
+        assert ai_engine.temperature <= 0.2

@@ -109,7 +109,9 @@ class Settings:
             # AI settings
             "ai_settings": {
                 "model": "claude-3-sonnet-20241022",
-                "temperature": 0.7,
+                # Low by default — Marcus's LLM work is mostly structured and
+                # wants deterministic output (see marcus_config.py notes).
+                "temperature": 0.1,
                 "max_tokens": 2000,
                 "retry_attempts": 3,
                 "retry_delay": 1.0,

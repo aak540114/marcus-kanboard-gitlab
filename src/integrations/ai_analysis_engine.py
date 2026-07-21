@@ -41,6 +41,15 @@ from src.cost_tracking.ai_usage_middleware import (
     ai_usage_middleware,
 )
 
+#: Temperature for the free-form ``generate_text`` path (prose / markdown such
+#: as acceptance-criteria checklists and report summaries). A touch of
+#: randomness keeps this human-facing text from reading robotically. It is set
+#: deliberately here rather than through the global config default, because
+#: everything else this engine does — decomposition, dependency inference, JSON
+#: extraction — wants the LOW, near-deterministic configured temperature so the
+#: output stays parseable and reproducible.
+_PROSE_TEMPERATURE = 0.7
+
 
 class AIAnalysisEngine:
     """
@@ -154,6 +163,20 @@ class AIAnalysisEngine:
             getattr(getattr(config, "ai", None), "model", None)
             or "claude-3-5-sonnet-20241022"
         )  # Using Sonnet 3.5 for speed/cost balance
+
+        # Default temperature for this engine's calls. Structured/JSON work
+        # (task analysis, dependency inference, decomposition, everything that
+        # routes through _call_claude) uses this configured value, which is
+        # LOW by design so the output is deterministic and parseable. The
+        # free-form generate_text() path overrides it with _PROSE_TEMPERATURE.
+        # `is None` (not `or`) so a deliberate 0.0 isn't bumped up. Coercion
+        # is guarded so a missing/malformed value (or a Mock config in tests)
+        # degrades to the safe low default instead of raising in __init__.
+        _cfg_temp = getattr(getattr(config, "ai", None), "temperature", None)
+        try:
+            self.temperature: float = 0.1 if _cfg_temp is None else float(_cfg_temp)
+        except (TypeError, ValueError):
+            self.temperature = 0.1
 
         # Analysis prompts
         self.prompts: Dict[str, str] = {
@@ -1632,7 +1655,9 @@ Return JSON with this format:
             "rationale": "Based on task label matching and project progress",
         }
 
-    async def _complete_raw(self, prompt: str) -> str:
+    async def _complete_raw(
+        self, prompt: str, temperature: Optional[float] = None
+    ) -> str:
         """Return the model's raw text for *prompt* (no JSON extraction).
 
         Shared transport for both :meth:`_call_claude` (which then extracts
@@ -1645,6 +1670,11 @@ Return JSON with this format:
         ----------
         prompt : str
             The prompt to send.
+        temperature : Optional[float]
+            Sampling temperature. ``None`` (the default) uses the engine's
+            configured :attr:`temperature`, which is LOW so structured/JSON
+            callers get deterministic, parseable output. The free-form
+            :meth:`generate_text` path passes a higher value explicitly.
 
         Returns
         -------
@@ -1656,6 +1686,8 @@ Return JSON with this format:
         Exception
             If no LLM backend is available or the call fails.
         """
+        if temperature is None:
+            temperature = self.temperature
         if not self._llm_available:
             raise Exception(
                 "No LLM backend available (no Anthropic client or claude CLI)"
@@ -1677,7 +1709,7 @@ Return JSON with this format:
         response = await self.client.messages.create(
             model=self.model,
             max_tokens=2000,
-            temperature=0.7,
+            temperature=temperature,
             messages=[{"role": "user", "content": prompt}],
         )
 
@@ -1733,7 +1765,9 @@ Return JSON with this format:
         str
             The model's response text.
         """
-        return await self._complete_raw(prompt)
+        # Prose/markdown output: opt into a higher temperature than the
+        # engine's low structured-work default (see _PROSE_TEMPERATURE).
+        return await self._complete_raw(prompt, temperature=_PROSE_TEMPERATURE)
 
     async def _call_claude(self, prompt: str) -> str:
         """
