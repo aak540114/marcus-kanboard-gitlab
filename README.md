@@ -53,7 +53,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 | Widget | What it does |
 |---|---|
 | **Active AI Agents badge** | Live green/grey/amber badge showing how many tickets are currently held by an AI agent. Updates every 15 s; hover to see ticket IDs. |
-| **Actively-worked card highlight** | Cards an AI agent is working **right now** (ticket state `in_progress`) get a pulsing golden ring. It clears automatically the moment the ticket moves on (waiting-for-human, blocked, done). Re-applied after Kanboard's own board redraws, so it never gets lost. |
+| **Actively-worked card highlight** | Cards an AI agent is working **right now** get a pulsing golden ring. It's driven by a *liveness* signal — the agent reported progress within the last ~40 s — **not** by ticket state/column, so a state-management bug that leaves a card stuck can't make the ring lie. It clears the moment the agent stops (finished, handed off, blocked, or went silent). Re-applied after Kanboard's own board redraws, so it never gets lost. |
 | **Project Description button** | Opens the Marcus-served project description page for this project — the AI agents' shared source of truth for language, framework, and architecture. |
 | **Repository button** | Links to this project's Gitea repository (opens in a new tab). Appears once the repo has been provisioned. |
 | **Human Gate / AI Gate toggle** | Sets the project-level gate mode. Human Gate (default): AI pauses for human review before done. AI Gate: AI merges and closes autonomously. |

@@ -4755,8 +4755,32 @@ function save() {{
                 for r in lm.all_records()
                 if r.ai_agent_id is not None
             ]
+
+            # Liveness signal for the board's "actively worked" highlight:
+            # ticket ids an agent has reported progress on within the last
+            # ~40s (see HumanGatedWorkflow.get_working_ticket_ids). This is
+            # derived purely from agent activity, NOT ticket state, so a
+            # stuck-column bug can't turn the highlight on/off. Empty when the
+            # workflow isn't wired.
+            working_ids: List[str] = []
+            try:
+                from src.marcus_mcp.tools.human_gated import (
+                    _workflow as _hg_workflow,
+                )
+
+                wf = _hg_workflow()
+                getter = getattr(wf, "get_working_ticket_ids", None) if wf else None
+                if getter is not None:
+                    working_ids = list(getter())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("working_ticket_ids lookup failed: %s", exc)
+
             response = JSONResponse(
-                {"active_agent_count": len(active), "agents": active}
+                {
+                    "active_agent_count": len(active),
+                    "agents": active,
+                    "working_ticket_ids": working_ids,
+                }
             )
             response.headers["Access-Control-Allow-Origin"] = "*"
             response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"

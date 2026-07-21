@@ -3043,3 +3043,75 @@ class TestParentAutoComplete:
         assert "new edited by human" in rec.acceptance_criteria
         assert "<!-- Sub-ticket of #310 -->" in rec.acceptance_criteria
         assert workflow._parent_of(rec) == "310"
+
+
+class TestActivityHeartbeat:
+    """The board 'actively worked' highlight is driven by a liveness heartbeat
+    (agent progress reports), decoupled from ticket state.
+
+    get_working_ticket_ids() returns tickets an agent reported progress on
+    within the activity window; a longer silence, or a terminal signal
+    (done/blocked/waiting), drops the ticket from the set.
+    """
+
+    def test_mark_then_get_returns_ticket(self, workflow):
+        """A just-marked ticket is reported as actively worked."""
+        workflow._mark_progress_activity("7")
+        assert "7" in workflow.get_working_ticket_ids()
+
+    def test_clear_removes_ticket(self, workflow):
+        """Clearing a heartbeat drops the ticket immediately."""
+        workflow._mark_progress_activity("7")
+        workflow._clear_progress_activity("7")
+        assert "7" not in workflow.get_working_ticket_ids()
+
+    def test_stale_entry_excluded_and_pruned(self, workflow):
+        """A report older than the window is excluded and pruned from memory."""
+        with patch(
+            "src.workflows.human_gated_workflow.time.monotonic", return_value=1000.0
+        ):
+            workflow._mark_progress_activity("7")
+        # 100s later — well past the ~40s window.
+        with patch(
+            "src.workflows.human_gated_workflow.time.monotonic", return_value=1100.0
+        ):
+            assert workflow.get_working_ticket_ids() == []
+        # Pruned: the internal map no longer holds the stale key.
+        assert workflow._progress_activity == {}
+
+    def test_within_window_still_active(self, workflow):
+        """A recent report (inside the window) still counts as active."""
+        with patch(
+            "src.workflows.human_gated_workflow.time.monotonic", return_value=1000.0
+        ):
+            workflow._mark_progress_activity("7")
+        with patch(
+            "src.workflows.human_gated_workflow.time.monotonic", return_value=1010.0
+        ):  # 10s later
+            assert workflow.get_working_ticket_ids() == ["7"]
+
+    def test_only_this_providers_tickets(self, workflow):
+        """The returned ids are bare ticket ids for this workflow's provider."""
+        workflow._mark_progress_activity("42")
+        ids = workflow.get_working_ticket_ids()
+        assert ids == ["42"]  # not "kanboard:42"
+
+    @pytest.mark.asyncio
+    async def test_report_progress_marks_activity(self, workflow, lifecycle):
+        """Posting a progress report stamps the ticket's heartbeat."""
+        lifecycle.get_or_create("50", "kanboard")
+        await workflow.report_progress("50", 50, "halfway")
+        assert "50" in workflow.get_working_ticket_ids()
+
+    @pytest.mark.asyncio
+    async def test_set_blocked_clears_activity(self, workflow, lifecycle):
+        """A blocked signal clears the heartbeat so the highlight drops."""
+        lifecycle.get_or_create("60", "kanboard")
+        lifecycle.transition("60", "kanboard", TicketState.READY)
+        lifecycle.transition("60", "kanboard", TicketState.IN_PROGRESS)
+        workflow._mark_progress_activity("60")
+        assert "60" in workflow.get_working_ticket_ids()
+
+        await workflow.set_blocked("60", blocked_by="dep #61")
+
+        assert "60" not in workflow.get_working_ticket_ids()

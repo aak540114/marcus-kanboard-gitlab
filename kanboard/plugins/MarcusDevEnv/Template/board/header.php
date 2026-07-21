@@ -173,12 +173,12 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
 }
 
 /* ── Actively-worked ticket highlight ─────────────────────────────────── */
-/* A golden ring marks the cards an AI agent is working RIGHT NOW (ticket
-   state == in_progress). It is removed automatically the moment the ticket
-   leaves in_progress (waiting-for-human, blocked, done, …). Rendered as a
-   box-shadow ring rather than a real `border` so it doesn't shift the card's
-   layout or fight Kanboard's own category-colored left border, and respects
-   the card's rounded corners. */
+/* A golden ring marks the cards an AI agent is working RIGHT NOW — driven by
+   Marcus's activity heartbeat (the agent reported progress in the last ~40s),
+   NOT by ticket state, so a card stuck in the wrong column can't wrongly show
+   or hide it. Rendered as a box-shadow ring rather than a real `border` so it
+   doesn't shift the card's layout or fight Kanboard's own category-colored
+   left border, and respects the card's rounded corners. */
 .task-board.marcus-ai-active {
     border-color: #f5b301 !important;
     /* The ring itself comes from the animation below. A CSS animation
@@ -344,11 +344,12 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
     var label   = document.getElementById('marcus-agent-label');
     var tooltip = document.getElementById('marcus-agent-tooltip');
 
-    // Ticket ids an AI agent is working RIGHT NOW (state === in_progress).
-    // Only these get the golden ring; a ticket that has moved on to
-    // waiting-for-human / blocked / done is no longer "actively worked" even
-    // though it may still carry an agent claim, so it is intentionally
-    // excluded here and its ring is removed on the next applyAgentBorders().
+    // Ticket ids an AI agent is working RIGHT NOW — from Marcus's liveness
+    // signal (working_ticket_ids: tickets an agent has reported progress on in
+    // the last ~40s), NOT from ticket state/column. That keeps the golden ring
+    // a true "an agent is actively working this" indicator even if a state bug
+    // leaves a card stuck in a column. The ring clears when the agent stops
+    // reporting (finished, handed off, blocked, or went silent).
     var activeTicketIds = Object.create(null);
 
     // (Re)paint the golden ring onto exactly the active cards and strip it
@@ -386,12 +387,11 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
                             + '</strong>&nbsp;&mdash;&nbsp;' + a.agent_id;
                     }).join('<br>');
                 }
-                // Rebuild the active set (only in_progress tickets) and repaint.
+                // Rebuild the active set from Marcus's activity-based liveness
+                // signal (not ticket state) and repaint the golden rings.
                 activeTicketIds = Object.create(null);
-                agents.forEach(function (a) {
-                    if (a.state === 'in_progress') {
-                        activeTicketIds[String(a.ticket_id)] = true;
-                    }
+                (data.working_ticket_ids || []).forEach(function (id) {
+                    activeTicketIds[String(id)] = true;
                 });
                 applyAgentBorders();
             })

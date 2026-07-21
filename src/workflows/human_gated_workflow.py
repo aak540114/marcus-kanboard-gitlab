@@ -50,6 +50,7 @@ HumanGatedWorkflow
 
 import logging
 import os
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, cast
 
@@ -71,6 +72,12 @@ from src.core.ticket_lifecycle import (
 from src.integrations.kanban_interface import KanbanInterface
 
 logger = logging.getLogger(__name__)
+
+#: How long after an agent's last progress report a ticket is still considered
+#: "actively worked" for the board highlight. Agents in orchestrate mode report
+#: roughly every 10s, so this comfortably spans a few missed beats; a longer
+#: silence (the agent finished, crashed, or stalled) lets the highlight lapse.
+_WORKING_WINDOW_SECONDS = 40.0
 
 
 def _ticket_priority_key(record: TicketRecord) -> Tuple[int, int]:
@@ -170,6 +177,14 @@ class HumanGatedWorkflow:
             on_error=self._on_watcher_error,
         )
         self._subscribed = False
+        # Liveness heartbeat for the board's "actively worked" highlight:
+        # ``{"<provider>:<ticket_id>": <monotonic ts>}`` set to *now* each time
+        # an agent reports progress on a ticket. This is a pure ACTIVITY
+        # signal, deliberately decoupled from ticket STATE — a bug that leaves
+        # a ticket stuck in a column must never turn the highlight on or off.
+        # In-memory only: a Marcus restart clears it and agents re-populate it
+        # on their next report.
+        self._progress_activity: Dict[str, float] = {}
         # How many tickets may be in progress at once (parallel-agent cap).
         self._max_parallel_agents = max(1, int(max_parallel_agents))
         # Unique identifier for this Marcus workflow instance. This is slot
@@ -1239,6 +1254,10 @@ class HumanGatedWorkflow:
         if report and report.strip() and active:
             summary = await self._summarize_report(report)
             await self._post_comment(active, f"🤖 **Worker progress:** {summary}")
+            # A report of any kind means the agent is alive on this ticket —
+            # stamp its heartbeat. Terminal intents below (done/blocked/waiting)
+            # go through signal_*/set_* which clear it again immediately.
+            self._mark_progress_activity(active)
             intent = self._classify_report_intent(report)
             if intent == "done":
                 await self.signal_ready_for_review(active)
@@ -1369,6 +1388,55 @@ class HumanGatedWorkflow:
     # Agent-facing helpers (called by MCP tools)
     # ------------------------------------------------------------------
 
+    def _mark_progress_activity(self, ticket_id: str) -> None:
+        """Stamp *now* as this ticket's last agent-progress report.
+
+        Called wherever an agent reports it is working (a progress comment,
+        a marcus_work report). Drives the board's "actively worked" golden
+        highlight — see :meth:`get_working_ticket_ids`.
+        """
+        self._progress_activity[f"{self._provider}:{ticket_id}"] = time.monotonic()
+
+    def _clear_progress_activity(self, ticket_id: str) -> None:
+        """Drop a ticket's heartbeat so its highlight clears at once.
+
+        Called on the terminal outcomes an agent reports — done, blocked, or
+        waiting-for-human — so the human sees the ring vanish immediately
+        rather than waiting for the activity window to lapse.
+        """
+        self._progress_activity.pop(f"{self._provider}:{ticket_id}", None)
+
+    def get_working_ticket_ids(
+        self, window_seconds: float = _WORKING_WINDOW_SECONDS
+    ) -> List[str]:
+        """Return ticket ids an agent has reported progress on very recently.
+
+        "Recently" means within ``window_seconds`` of now — i.e. an agent is
+        actively working the ticket RIGHT NOW. This is intentionally derived
+        only from real agent activity (progress reports), never from ticket
+        state, so it stays accurate even if a state-management bug leaves a
+        ticket stuck in a column. Stale entries are pruned as they are found.
+
+        Parameters
+        ----------
+        window_seconds : float
+            Maximum age of the last report for a ticket to still count as
+            actively worked.
+
+        Returns
+        -------
+        List[str]
+            Ticket ids (for this workflow's provider) currently being worked.
+        """
+        now = time.monotonic()
+        working: List[str] = []
+        for key, ts in list(self._progress_activity.items()):
+            if now - ts <= window_seconds:
+                working.append(key.split(":", 1)[1])
+            else:
+                self._progress_activity.pop(key, None)
+        return working
+
     async def report_progress(
         self,
         ticket_id: str,
@@ -1394,6 +1462,9 @@ class HumanGatedWorkflow:
         record = self._lifecycle.get(ticket_id, self._provider)
         if record is None:
             return False
+
+        # The agent is actively working — refresh its liveness heartbeat.
+        self._mark_progress_activity(ticket_id)
 
         branch_mgr = await self._branch_for_ticket(ticket_id)
         commits = await branch_mgr.get_branch_commits(record.branch_name)
@@ -1448,6 +1519,10 @@ class HumanGatedWorkflow:
                 record.state.value,
             )
             return False
+
+        # Genuine done signal → the agent is no longer working this ticket.
+        # Clear its liveness heartbeat so the board highlight drops at once.
+        self._clear_progress_activity(ticket_id)
 
         gate = await self._get_effective_gate(ticket_id)
 
@@ -1563,6 +1638,10 @@ class HumanGatedWorkflow:
             )
             return await self._post_comment(ticket_id, note)
 
+        # Human gate: the ticket genuinely pauses for the human, so the agent
+        # is no longer working it — clear its liveness heartbeat.
+        self._clear_progress_activity(ticket_id)
+
         # ── Human gate: block until human responds ─────────────────────
         # Comment first, state second — same recoverability guarantee as
         # signal_ready_for_review (see the comment there): a failed post
@@ -1634,6 +1713,10 @@ class HumanGatedWorkflow:
 
         if record.state != TicketState.IN_PROGRESS:
             return False
+
+        # Blocked → the agent has stopped working this ticket; clear its
+        # liveness heartbeat so the board highlight drops at once.
+        self._clear_progress_activity(ticket_id)
 
         try:
             self._lifecycle.transition(
