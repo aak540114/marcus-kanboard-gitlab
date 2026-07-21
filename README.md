@@ -400,9 +400,9 @@ When `MARCUS_AGENT_TOKEN` is set (automatic once you allow remote access — see
 | `/mcp` | GET/POST | MCP protocol — all AI agent tooling |
 | `/webhooks/kanboard` | POST | Receives Kanboard push webhooks (own `?token=` auth) |
 | `/webhooks/gitea` | POST | Receives Gitea push webhooks, triggers an instant dev-env refresh (own `X-Gitea-Signature` HMAC auth — see [Hot-reload dev environments](#hot-reload-dev-environments)) |
-| `/dev-env/view?ticket_id=<id>&project_id=<id>` | GET | Starts hot-reload dev environment, redirects to preview URL |
+| `/dev-env/view?ticket_id=<id>&project_id=<id>` | GET | Starts hot-reload dev environment; serves a "building preview" page that auto-redirects the instant the app is actually listening (no more `ERR_CONNECTION_REFUSED`) |
 | `/dev-env/stop?ticket_id=<id>` | POST | Tears down a running dev environment |
-| `/api/dev-env/status?ticket_id=<id>` | GET | Returns `{running, url}` for a ticket's dev environment |
+| `/api/dev-env/status?ticket_id=<id>` | GET | Returns `{running, serving, url}` — `running` = container alive; `serving` = its port is actually accepting connections |
 | `/api/dev-env-setting` | GET/PUT | Global `max_parallel_containers` limit (`null` = unlimited) — see [Hot-reload dev environments](#hot-reload-dev-environments) |
 | `/api/active-agents` | GET | All tickets currently claimed by an AI agent |
 | `/api/events/stream` | GET | Server-Sent Events stream — pushes a `refresh` event the instant Marcus/an agent changes anything; the MarcusDevEnv plugin reloads the page on it (auth via `?token=`, since EventSource can't send headers) |
@@ -421,6 +421,10 @@ Clicking **Open** in a ticket's **Marcus Dev Environment** panel (or visiting `/
 **Instant refresh, no polling:** every dev-env container's code directory is the same host path Marcus and the agent both operate on. The first time an agent asks for a ticket's work context, Marcus auto-creates that project's Gitea repo *and* a push webhook (`GiteaManager.create_webhook`, signed with `GITEA_WEBHOOK_TOKEN`) — zero manual clicks in Gitea's UI. From then on, every `git push` to the ticket branch POSTs to `/webhooks/gitea`, which runs `git fetch && git reset --hard` inside the running container. The container's own file-watcher (inotify restart loop, or the stack's native hot-module-reload for Node/Vite, cargo-watch, air) picks up the change automatically — the same mechanism as if you'd run `git pull` and the dev server noticed on its own.
 
 **Resource limit:** the board header's "Max dev environments" `[−] N [+]` counter (backed by `/api/dev-env-setting`) caps how many of these containers can run at once, globally. Once the limit is hit, `/dev-env/view` returns an error until an existing environment is stopped — `∞` (the default) means no limit.
+
+**Always serves something, never a blank error page:** the container runs on a lightweight `python:3.12-alpine` base and its start-up script is written so the preview port is *always* answered. If the project's real dev command can't start (a static HTML game with no build step, a missing `dev` script, a crash on boot), the container automatically falls back to `python3 -m http.server` and serves the branch's files as a plain website — so a human can still open it and see what the agents built. Because `python3` is baked into the base image, this fallback needs zero package installation and can't itself fail for lack of a runtime. Practically, this fixes the old failure mode where a container would exit on a bad start command, get auto-removed (`--rm`), vanish from `docker ps`, and leave the browser stuck on `ERR_CONNECTION_REFUSED`.
+
+**No redirect to a dead port:** starting a container is asynchronous — `docker run` returns before the app inside is listening. `/dev-env/view` therefore serves a small "building preview…" page that polls `/api/dev-env/status` and redirects your browser the instant `serving` flips true (i.e. the port accepts connections). You watch a spinner for a few seconds instead of hitting a connection-refused error and guessing when to refresh.
 
 **Safety and robustness (hardened after an adversarial review pass):**
 - `/dev-env/view` verifies a ticket actually belongs to the `project_id` it's given (via a live Kanboard lookup) before auto-provisioning that project's Gitea repo/webhook — a stray or spoofed `project_id` can't force-create a repo for a project it isn't tied to.

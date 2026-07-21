@@ -7,6 +7,7 @@ to specialized modules for better maintainability.
 
 import asyncio
 import atexit
+import html
 import json
 import logging
 import os
@@ -3613,6 +3614,115 @@ async def _resolve_ticket_repo_path(
     return mapping.get("local_repo_path") if mapping else None
 
 
+def _dev_env_starting_page(ticket_id: str, provider: str, url: str) -> str:
+    """Build the interim "building preview" HTML page for ``/dev-env/view``.
+
+    A dev-environment container starts asynchronously: ``docker run -d``
+    returns before the entrypoint has installed dependencies, checked out
+    the branch, and started the dev server. Redirecting the browser
+    immediately therefore lands it on a not-yet-listening port
+    (``ERR_CONNECTION_REFUSED``). This page is served instead; it polls
+    ``/api/dev-env/status`` and only navigates to the real preview once that
+    endpoint reports ``serving: true`` — so the human sees a friendly
+    "building…" spinner rather than a browser error, and never has to guess
+    when to refresh.
+
+    Parameters
+    ----------
+    ticket_id : str
+        Provider ticket identifier (already validated against a safe
+        character set by the caller before it reaches this template).
+    provider : str
+        Kanban provider name (also pre-validated by the caller).
+    url : str
+        The final preview URL to redirect to once the app is serving.
+
+    Returns
+    -------
+    str
+        A complete, self-contained HTML document.
+    """
+    # json.dumps() safely escapes these into JS string literals. ticket_id
+    # and provider are already constrained to [A-Za-z0-9._-] by the route,
+    # but encoding keeps this template robust if that ever changes.
+    ticket_js = json.dumps(ticket_id)
+    provider_js = json.dumps(provider)
+    url_js = json.dumps(url)
+    ticket_html = html.escape(ticket_id)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Building preview — ticket {ticket_html}</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font-family: system-ui, -apple-system, sans-serif; margin: 0;
+          min-height: 100vh; display: flex; align-items: center;
+          justify-content: center; background: #0f172a; color: #e2e8f0; }}
+  .card {{ text-align: center; max-width: 460px; padding: 40px 32px; }}
+  .spinner {{ width: 46px; height: 46px; margin: 0 auto 24px;
+              border: 4px solid #334155; border-top-color: #38bdf8;
+              border-radius: 50%; animation: spin 0.9s linear infinite; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  h1 {{ font-size: 1.25rem; margin: 0 0 8px; font-weight: 600; }}
+  p  {{ margin: 6px 0; color: #94a3b8; font-size: 0.92rem; }}
+  #elapsed {{ font-variant-numeric: tabular-nums; }}
+  a.btn {{ display: inline-block; margin-top: 18px; color: #38bdf8;
+           text-decoration: none; font-size: 0.9rem; }}
+  a.btn:hover {{ text-decoration: underline; }}
+  .err {{ color: #f87171; }}
+  @media (prefers-reduced-motion: reduce) {{ .spinner {{ animation: none; }} }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="spinner" id="spin"></div>
+  <h1 id="title">Building preview for ticket {ticket_html}…</h1>
+  <p id="detail">Installing dependencies and starting the app. This can take
+     up to a minute the first time.</p>
+  <p><span id="elapsed">0</span>s elapsed</p>
+  <a class="btn" id="manual" href="{html.escape(url)}" style="display:none">
+     Open preview manually →</a>
+</div>
+<script>
+  var TICKET = {ticket_js}, PROVIDER = {provider_js}, URL = {url_js};
+  var started = Date.now();
+  var everRunning = false;
+  var el = document.getElementById.bind(document);
+  setInterval(function () {{
+    el("elapsed").textContent = Math.round((Date.now() - started) / 1000);
+  }}, 250);
+  function fail(msg) {{
+    el("spin").style.display = "none";
+    el("title").textContent = "Preview could not start";
+    el("title").className = "err";
+    el("detail").textContent = msg;
+    var m = el("manual"); m.textContent = "Try again"; m.href = location.href;
+    m.style.display = "inline-block";
+  }}
+  function poll() {{
+    fetch("/api/dev-env/status?ticket_id=" + encodeURIComponent(TICKET) +
+          "&provider=" + encodeURIComponent(PROVIDER), {{ cache: "no-store" }})
+      .then(function (r) {{ return r.json(); }})
+      .then(function (s) {{
+        if (s.serving) {{ window.location.replace(s.url || URL); return; }}
+        if (s.running) {{ everRunning = true; }}
+        else if (everRunning) {{
+          fail("The container exited before the app came up. Check the "
+               + "project's Tech Stack / dev-server command, then retry.");
+          return;
+        }}
+        setTimeout(poll, 1500);
+      }})
+      .catch(function () {{ setTimeout(poll, 2000); }});
+  }}
+  poll();
+</script>
+</body>
+</html>"""
+
+
 async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
     """Construct and start the human-gated ticket workflow subsystem.
 
@@ -4159,8 +4269,27 @@ if __name__ == "__main__":
                         repo_path=repo_path,
                     )
 
-                if info and info.url:
+                # The container has only just been asked to start: `docker
+                # run -d` returns immediately, long before the entrypoint has
+                # installed packages, checked out the branch, and brought up
+                # the dev server. Redirecting the browser now lands it on a
+                # dead port (ERR_CONNECTION_REFUSED). Only jump straight to
+                # the preview if the port is ALREADY answering; otherwise
+                # serve a lightweight page that polls readiness and redirects
+                # itself the instant the app is up.
+                is_serving = getattr(dev_mgr, "is_serving", None)
+                if (
+                    info
+                    and info.url
+                    and is_serving is not None
+                    and is_serving(ticket_id, provider)
+                ):
                     return RedirectResponse(info.url, status_code=302)
+
+                if info and info.url:
+                    return HTMLResponse(
+                        _dev_env_starting_page(ticket_id, provider, info.url)
+                    )
 
                 return HTMLResponse(
                     f"<h1>Dev environment for ticket {ticket_id} is starting…</h1>"
@@ -4512,8 +4641,17 @@ function save() {{
 
             Response body
             -------------
-            ``{"running": true,  "url": "http://localhost:9234"}``
-            ``{"running": false, "url": null}``
+            ``{"running": true, "serving": true,  "url": "http://localhost:9234"}``
+            ``{"running": true, "serving": false, "url": "http://localhost:9234"}``
+            ``{"running": false, "serving": false, "url": null}``
+
+            ``running`` means a container is registered and alive;
+            ``serving`` means its port is actually accepting connections
+            (dependency install / branch checkout / server start finished).
+            The ``/dev-env/view`` "building preview" page polls this and
+            only redirects the browser once ``serving`` is ``true`` — that
+            is what stops the human from ever landing on a
+            ``ERR_CONNECTION_REFUSED`` page.
             """
             ticket_id = request.query_params.get("ticket_id", "")
             provider = request.query_params.get("provider", server.provider)
@@ -4531,8 +4669,20 @@ function save() {{
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("Dev env liveness check failed: %s", exc)
             info = dev_mgr.get_info(ticket_id, provider) if dev_mgr and ticket_id else None
+            serving = False
+            if info is not None:
+                is_serving = getattr(dev_mgr, "is_serving", None)
+                if is_serving is not None:
+                    try:
+                        serving = is_serving(ticket_id, provider)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Dev env serving check failed: %s", exc)
             response = JSONResponse(
-                {"running": info is not None, "url": info.url if info else None}
+                {
+                    "running": info is not None,
+                    "serving": serving,
+                    "url": info.url if info else None,
+                }
             )
             response.headers["Access-Control-Allow-Origin"] = "*"
             return response

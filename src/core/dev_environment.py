@@ -83,57 +83,94 @@ _READY_POLL_MAX_ATTEMPTS = 5
 # Project-type detection
 # ---------------------------------------------------------------------------
 
-#: Single base image for all dev environments.  ``debian:bookworm-slim``
-#: starts in under a second, ships ``apt-get`` so any runtime can be
-#: installed, and is ~75 MB — faster than any language-specific full image.
-_BASE_IMAGE = "debian:bookworm-slim"
+#: Single base image for all dev environments.  ``python:3.12-alpine`` is
+#: ~50 MB, starts in well under a second, and — crucially — ships a working
+#: ``python3`` interpreter out of the box.  That lets the entrypoint fall
+#: back to ``python3 -m http.server`` with **zero** package installation
+#: when a project has no build step (a plain HTML/JS game, a static site) or
+#: when the real dev command fails to start.  The previous
+#: ``debian:bookworm-slim`` base had no interpreter at all, so even serving a
+#: static file required a slow, network-dependent ``apt-get install`` that,
+#: when it failed, left the ``--rm`` container dead and invisible in
+#: ``docker ps`` while the browser got ``ERR_CONNECTION_REFUSED``.
+_BASE_IMAGE = "python:3.12-alpine"
 
-#: apt packages always installed in the base layer before the project setup.
-_BASE_APT = "git curl inotify-tools build-essential ca-certificates"
+#: Alpine ``apk`` packages installed before project setup.  ``git`` is
+#: required for the branch checkout; ``inotify-tools`` powers the file-watch
+#: restart loop for non-hot-reload stacks; ``curl`` is a convenience for
+#: agent-authored health checks.  Installation is best-effort (``|| true``)
+#: so a transient network hiccup never stops the container from serving.
+_BASE_APK = "git inotify-tools curl"
+
+#: Port the application is expected to listen on **inside** the container.
+#: The host-side port (allocated by :class:`PortAllocator`) is published to
+#: this one via ``docker run -p <host>:<_APP_PORT>``.
+_APP_PORT = 3000
+
+#: Guaranteed-available fallback server.  ``python3`` is always present in
+#: :data:`_BASE_IMAGE`, so this command can never fail for lack of a runtime.
+#: It serves the checked-out branch's files (the container's ``/app`` working
+#: directory) as a static website — perfect for the common case of letting a
+#: human open a browser and *see* what an agent built.
+_STATIC_FALLBACK = f"python3 -m http.server {_APP_PORT}"
 
 # ---------------------------------------------------------------------------
 # Fallback stack table — used when no ProjectStack is supplied and
 # auto_detect=True sniffs well-known project files from the repo root.
 # ---------------------------------------------------------------------------
 
-#: Maps detected stack key → (install_cmd, dev_cmd, use_hm_reload).
+#: Maps detected stack key → (install_cmd, dev_cmd, use_hm_reload, apk).
 #: ``use_hm_reload`` is True only for stacks where killing the process on
 #: each file save would break browser-side hot-module state (Node.js/Vite)
-#: or interrupt an incremental compile cycle (cargo-watch, air).
+#: or interrupt an incremental compile cycle (cargo-watch, air).  ``apk`` is
+#: the list of Alpine packages that install the language runtime the stack
+#: needs on top of :data:`_BASE_IMAGE` (which already ships ``python3``);
+#: an empty list means "the base image already has everything".
 _FALLBACK_STACKS: Dict[str, Dict[str, Any]] = {
     "nodejs":         {"install": "npm install",
                        "start":   "npm run dev -- --port 3000",
-                       "hm":      True},
+                       "hm":      True,
+                       "apk":     ["nodejs", "npm"]},
     "python-fastapi": {"install": "pip install --no-cache-dir -r requirements.txt",
                        "start":   "uvicorn main:app --host 0.0.0.0 --port 3000",
-                       "hm":      False},
+                       "hm":      False,
+                       "apk":     []},
     "python-flask":   {"install": "pip install --no-cache-dir -r requirements.txt",
                        "start":   "flask run --host 0.0.0.0 --port 3000",
-                       "hm":      False},
+                       "hm":      False,
+                       "apk":     []},
     "python-django":  {"install": "pip install --no-cache-dir -r requirements.txt",
                        "start":   "python manage.py runserver 0.0.0.0:3000 --noreload",
-                       "hm":      False},
+                       "hm":      False,
+                       "apk":     []},
     "python":         {"install": "pip install --no-cache-dir -r requirements.txt 2>/dev/null || true",
                        "start":   "python3 -m http.server 3000",
-                       "hm":      False},
+                       "hm":      False,
+                       "apk":     []},
     "rust":           {"install": "cargo install cargo-watch",
                        "start":   "cargo watch -x run",
-                       "hm":      True},
+                       "hm":      True,
+                       "apk":     ["rust", "cargo"]},
     "go":             {"install": "go install github.com/air-verse/air@latest",
                        "start":   "$(go env GOPATH)/bin/air",
-                       "hm":      True},
+                       "hm":      True,
+                       "apk":     ["go"]},
     "ruby":           {"install": "bundle install 2>/dev/null || true",
                        "start":   "bundle exec ruby app.rb -p 3000 2>/dev/null || ruby app.rb -p 3000",
-                       "hm":      False},
+                       "hm":      False,
+                       "apk":     ["ruby"]},
     "java":           {"install": "mvn dependency:resolve -q 2>/dev/null || true",
                        "start":   "mvn spring-boot:run -Dspring-boot.run.jvmArguments='-Dserver.port=3000'",
-                       "hm":      False},
+                       "hm":      False,
+                       "apk":     ["openjdk17", "maven"]},
     "php":            {"install": "composer install 2>/dev/null || true",
                        "start":   "php -S 0.0.0.0:3000",
-                       "hm":      False},
+                       "hm":      False,
+                       "apk":     ["php"]},
     "static":         {"install": "",
                        "start":   "python3 -m http.server 3000",
-                       "hm":      False},
+                       "hm":      False,
+                       "apk":     []},
 }
 
 # Keep public alias so existing imports don't break while we migrate callers.
@@ -667,6 +704,47 @@ class DevEnvironmentManager:
         """
         return self._envs.get(f"{provider}:{ticket_id}")
 
+    def is_serving(self, ticket_id: str, provider: str) -> bool:
+        """Return ``True`` only once the app actually accepts connections.
+
+        A container can be *registered and running* (``docker run -d`` has
+        returned) yet not *serving* — its entrypoint may still be installing
+        packages, checking out the branch, or starting the dev server. The
+        ``/dev-env/view`` route uses this to decide whether the human's
+        browser can be redirected to the preview yet: redirecting to a
+        not-yet-listening port is exactly what produced the
+        ``ERR_CONNECTION_REFUSED`` symptom this method exists to prevent.
+
+        The check is a plain TCP connect to the *host-side* port the
+        container publishes to (``docker run -p <port>:3000``), so it works
+        identically whether Marcus itself runs on the host or in a sibling
+        container.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+
+        Returns
+        -------
+        bool
+            ``True`` if an environment is registered for this ticket and its
+            port is accepting TCP connections; ``False`` otherwise.
+        """
+        info = self._envs.get(f"{provider}:{ticket_id}")
+        if info is None:
+            return False
+        return self._port_is_listening(info.port)
+
+    @staticmethod
+    def _port_is_listening(port: int) -> bool:
+        """Return ``True`` if something accepts TCP on ``127.0.0.1:port``."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.2)
+            return sock.connect_ex(("127.0.0.1", port)) == 0
+
     def list_running(self) -> List[DevEnvironmentInfo]:
         """Return all currently running dev environments."""
         return list(self._envs.values())
@@ -912,45 +990,83 @@ class DevEnvironmentManager:
         str
             A ``sh -c`` compatible shell command string.
         """
-        apt_extras = " ".join(extra_apt) if extra_apt else ""
-        apt_line = (
-            f"apt-get update -qq && apt-get install -y --no-install-recommends "
-            f"{_BASE_APT}{' ' + apt_extras if apt_extras else ''}"
+        apk_extras = " ".join(extra_apt) if extra_apt else ""
+        # Best-effort (`|| true`): a transient package-index failure must
+        # never stop the container from serving — the static fallback below
+        # only needs `python3`, which is already baked into _BASE_IMAGE.
+        apk_line = (
+            f"apk add --no-cache {_BASE_APK}"
+            f"{' ' + apk_extras if apk_extras else ''} 2>/dev/null || true"
         )
+
+        # The repo is bind-mounted from the host, so its files are owned by a
+        # different uid than the container's root — modern git refuses to
+        # operate on such a tree ("detected dubious ownership") and the
+        # checkout would abort. Marking /app safe up-front prevents that.
+        safe_dir = "git config --global --add safe.directory /app 2>/dev/null || true"
 
         # branch_name is interpreted as shell syntax by the `sh -c` this
         # string is eventually passed to inside the container — quote it
         # so shell metacharacters in an unsanitized caller's input can't
         # break out of `git checkout` into arbitrary command execution.
+        # `|| true` keeps a checkout failure (detached HEAD, already on the
+        # branch, missing ref) from aborting the whole entrypoint — we still
+        # want to serve whatever is in /app.
         #
         # The `touch _READY_MARKER` immediately after checkout lets
         # refresh() (see _wait_until_ready) confirm the initial checkout
         # has actually happened before running its own git commands
-        # against /app — apt-get above can take tens of seconds, and
+        # against /app — apk above can take a few seconds, and
         # `docker run -d` returns long before this script reaches here.
         steps = [
-            apt_line,
-            f"git checkout {shlex.quote(branch_name)}",
+            apk_line,
+            safe_dir,
+            f"git checkout {shlex.quote(branch_name)} 2>/dev/null || true",
             f"touch {_READY_MARKER}",
         ]
         if install_cmd:
-            steps.append(install_cmd)
+            # `|| true` so a failed dependency install still reaches the
+            # start command (which itself falls back to the static server).
+            steps.append(f"{install_cmd} || true")
+
+        # Wrap the real dev command so that if it exits non-zero or crashes
+        # (missing "dev" script, wrong port, syntax error) the container
+        # falls back to serving /app statically instead of dying. Because
+        # containers run with --rm, a dying entrypoint would vanish from
+        # `docker ps` entirely and the browser would get ERR_CONNECTION_REFUSED
+        # with no way to diagnose it — the fallback guarantees the port is
+        # always answered and the container stays alive and inspectable.
+        served = f"( {start_cmd} || {_STATIC_FALLBACK} )"
 
         if use_hm_reload:
-            steps.append(start_cmd)
+            steps.append(served)
             return " && ".join(steps)
 
         # inotifywait restart loop for interpreted / non-HMR stacks.
-        setup_part = " && ".join(steps)
+        #
+        # Setup steps are joined with ';' (not '&&') and each is already
+        # '|| true', so a hiccup during setup never prevents the server from
+        # starting.  The served command is backgrounded and its PID tracked
+        # so a file change can restart it.
+        #
+        # The trailing `wait $APP_PID` is essential: it keeps the container's
+        # PID 1 alive (and the port served) even when `inotifywait` is
+        # missing or errors.  In that case the `while` condition fails on the
+        # first evaluation and the loop exits immediately; without the final
+        # wait the shell would fall off the end, PID 1 would exit, and the
+        # `--rm` container would vanish from `docker ps` mid-serve — the very
+        # failure this whole rework exists to eliminate.
+        setup_part = "; ".join(steps)
         return (
-            f"{setup_part} && "
-            f"{start_cmd} & APP_PID=$! && "
+            f"{setup_part}; "
+            f"{served} & APP_PID=$!; "
             f"while inotifywait -e modify,create,delete,move -r /app "
             f"--exclude '\\.git' --quiet 2>/dev/null; do "
             f"echo '[marcus] File changed — restarting...'; "
             f"kill $APP_PID 2>/dev/null; wait $APP_PID 2>/dev/null; "
-            f"{start_cmd} & APP_PID=$!; "
-            f"done"
+            f"{served} & APP_PID=$!; "
+            f"done; "
+            f"wait $APP_PID"
         )
 
     async def _start_docker(
@@ -982,11 +1098,15 @@ class DevEnvironmentManager:
         # ── Resolve install/start commands ──────────────────────────────
         extra_apt: List[str] = []
         if project_stack is not None:
-            # Primary path: stack from project description
+            # Primary path: stack from project description.  Prefer Alpine
+            # package names (apk_packages) since _BASE_IMAGE is alpine-based;
+            # fall back to the legacy apt_packages list for older callers.
             install_cmd: str = project_stack.install_cmd
             start_cmd: str = project_stack.dev_cmd
             use_hm_reload: bool = project_stack.use_hm_reload
-            extra_apt = getattr(project_stack, "apt_packages", [])
+            extra_apt = getattr(project_stack, "apk_packages", None) or getattr(
+                project_stack, "apt_packages", []
+            )
             logger.info(
                 "Using project-description stack %r for %s",
                 project_stack.language,
@@ -999,6 +1119,7 @@ class DevEnvironmentManager:
             install_cmd = fb["install"]
             start_cmd = fb["start"]
             use_hm_reload = fb["hm"]
+            extra_apt = fb.get("apk", [])
             logger.info(
                 "Auto-detected stack %r for %s (no project description)",
                 stack_key,

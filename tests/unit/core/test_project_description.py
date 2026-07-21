@@ -233,6 +233,34 @@ class TestParseStackFromText:
         stack = ProjectStack(language="cobol", extra_apt=["some-pkg"])
         assert stack.apt_packages == ["some-pkg"]
 
+    # ── apk_packages property (Alpine names for the live dev-env image) ──
+
+    def test_python_apk_packages_empty(self):
+        """python needs no extra apk package — python3/pip are in the base image."""
+        stack = ProjectStack(language="python")
+        assert stack.apk_packages == []
+
+    def test_nodejs_apk_packages(self):
+        """nodejs stack installs nodejs + npm via apk."""
+        stack = ProjectStack(language="nodejs")
+        assert "nodejs" in stack.apk_packages
+        assert "npm" in stack.apk_packages
+
+    def test_go_apk_uses_alpine_name(self):
+        """Go's Alpine package is 'go', not Debian's 'golang'."""
+        stack = ProjectStack(language="go")
+        assert stack.apk_packages == ["go"]
+
+    def test_java_apk_uses_alpine_name(self):
+        """Java's Alpine package is 'openjdk17', not Debian's 'default-jdk'."""
+        stack = ProjectStack(language="java")
+        assert "openjdk17" in stack.apk_packages
+
+    def test_extra_apk_appended(self):
+        """extra_apt packages are appended to the apk base list too."""
+        stack = ProjectStack(language="nodejs", extra_apt=["imagemagick"])
+        assert "imagemagick" in stack.apk_packages
+
 
 # ---------------------------------------------------------------------------
 # ProjectDescriptionManager

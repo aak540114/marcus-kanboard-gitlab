@@ -1046,3 +1046,154 @@ class TestRefreshByBranch:
 
         assert result is False
         docker_manager.refresh.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Resilient entrypoint: alpine base + apk + guaranteed static fallback.
+#
+# The container previously ran on debian:bookworm-slim and installed every
+# runtime at start via apt-get; a failure left the --rm container dead and
+# invisible in `docker ps` while the browser got ERR_CONNECTION_REFUSED. The
+# new entrypoint installs via apk (best-effort) and always falls back to
+# `python3 -m http.server` (python3 ships in the base image), so the port is
+# always answered and the container always stays alive/inspectable.
+# ---------------------------------------------------------------------------
+
+
+class TestEntrypointResilience:
+    """The generated entrypoint must never leave the port unanswered."""
+
+    def _mgr(self) -> DevEnvironmentManager:
+        return DevEnvironmentManager(DevEnvironmentConfig())
+
+    def test_base_image_is_alpine(self) -> None:
+        """The single base image is a lightweight alpine image."""
+        from src.core.dev_environment import _BASE_IMAGE
+
+        assert "alpine" in _BASE_IMAGE
+
+    def test_uses_apk_not_apt(self) -> None:
+        """Package install uses Alpine's apk, never Debian apt-get."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="npm install", start_cmd="npm run dev", use_hm_reload=True
+        )
+        assert "apk add" in cmd
+        assert "apt-get" not in cmd
+
+    def test_marks_app_dir_git_safe(self) -> None:
+        """The bind-mounted /app is marked a safe git directory before checkout."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="", start_cmd="python3 -m http.server 3000",
+            use_hm_reload=False,
+        )
+        assert "safe.directory /app" in cmd
+
+    def test_static_fallback_present_for_hm_stack(self) -> None:
+        """HMR stacks fall back to python http.server if the dev cmd fails."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="npm install",
+            start_cmd="npm run dev -- --port 3000", use_hm_reload=True,
+        )
+        assert "python3 -m http.server 3000" in cmd
+        assert "npm run dev" in cmd
+
+    def test_static_fallback_present_for_non_hm_stack(self) -> None:
+        """Non-HMR stacks also fall back to the static server on failure."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="",
+            start_cmd="flask run --host 0.0.0.0 --port 3000", use_hm_reload=False,
+        )
+        assert "python3 -m http.server 3000" in cmd
+        assert "flask run" in cmd
+
+    def test_install_failure_is_non_fatal(self) -> None:
+        """A failed dependency install must not abort the entrypoint."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="npm install", start_cmd="npm run dev",
+            use_hm_reload=True,
+        )
+        assert "npm install || true" in cmd
+
+    def test_non_hm_keeps_pid1_alive_when_watcher_exits(self) -> None:
+        """A non-HMR entrypoint waits on the server so PID 1 (and the
+        container) never exits early if inotifywait is missing/errors —
+        otherwise the --rm container would vanish from `docker ps` mid-serve."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="",
+            start_cmd="python -m http.server 3000", use_hm_reload=False,
+        )
+        # The loop is followed by a final `wait $APP_PID`.
+        done_idx = cmd.rindex("done")
+        wait_idx = cmd.rindex("wait $APP_PID")
+        assert wait_idx > done_idx, "final `wait $APP_PID` must follow the watch loop"
+
+    @pytest.mark.asyncio
+    async def test_docker_run_uses_alpine_base(self, tmp_path) -> None:
+        """`docker run` is invoked with the alpine base image."""
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path), use_docker=True, auto_detect=False,
+            dev_command="npm run dev -- --port {port}", port_range=(20050, 20100),
+        )
+        mgr = DevEnvironmentManager(
+            config=config, settings_manager=DevEnvSettingsManager(data_dir=tmp_path)
+        )
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await mgr.start("T-50", "kanboard", "ticket/kanboard/t-50")
+        cmd = mock_run.call_args[0][0]
+        assert any("alpine" in str(part) for part in cmd)
+
+
+# ---------------------------------------------------------------------------
+# is_serving(): a container can be registered/running yet not yet answering
+# on its port. The /dev-env/view route uses this to decide when it is safe to
+# redirect the browser (avoids ERR_CONNECTION_REFUSED).
+# ---------------------------------------------------------------------------
+
+
+class TestIsServing:
+    """DevEnvironmentManager.is_serving reflects real port readiness."""
+
+    @pytest.fixture
+    def docker_manager(self, tmp_path):
+        return DevEnvironmentManager(
+            config=DevEnvironmentConfig(repo_path=str(tmp_path), use_docker=True),
+            settings_manager=DevEnvSettingsManager(data_dir=tmp_path),
+        )
+
+    def _register(self, manager, port):
+        from src.core.dev_environment import DevEnvironmentInfo
+
+        manager._envs["kanboard:T-1"] = DevEnvironmentInfo(
+            ticket_id="T-1", provider="kanboard", branch_name="b",
+            port=port, container_name="c", url=f"http://localhost:{port}",
+        )
+
+    def test_port_is_listening_true_for_bound_socket(self) -> None:
+        """_port_is_listening detects a real listening socket."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            s.listen(1)
+            port = s.getsockname()[1]
+            assert DevEnvironmentManager._port_is_listening(port) is True
+
+    def test_is_serving_false_when_not_registered(self, docker_manager) -> None:
+        """No env registered → not serving."""
+        assert docker_manager.is_serving("T-9", "kanboard") is False
+
+    def test_is_serving_true_when_port_listens(self, docker_manager) -> None:
+        """Registered env whose port answers → serving."""
+        self._register(docker_manager, 12345)
+        with patch.object(
+            DevEnvironmentManager, "_port_is_listening", return_value=True
+        ):
+            assert docker_manager.is_serving("T-1", "kanboard") is True
+
+    def test_is_serving_false_when_port_closed(self, docker_manager) -> None:
+        """Registered env whose port is closed (still building) → not serving."""
+        self._register(docker_manager, 12345)
+        with patch.object(
+            DevEnvironmentManager, "_port_is_listening", return_value=False
+        ):
+            assert docker_manager.is_serving("T-1", "kanboard") is False

@@ -113,7 +113,12 @@ class ProjectStack:
 
     @property
     def apt_packages(self) -> List[str]:
-        """Base apt packages for the detected language + any extras."""
+        """Base Debian ``apt`` packages for the language + any extras.
+
+        Retained for backward compatibility with callers that still run a
+        Debian-based image.  The live dev-environment image is Alpine-based,
+        so :meth:`apk_packages` is the preferred property there.
+        """
         base: List[str] = []
         lang = self.language.lower()
         if lang == "python":
@@ -130,6 +135,36 @@ class ProjectStack:
             base = ["default-jdk", "maven"]
         elif lang == "php":
             base = ["php-cli", "composer"]
+        return base + self.extra_apt
+
+    @property
+    def apk_packages(self) -> List[str]:
+        """Alpine ``apk`` packages for the language runtime + any extras.
+
+        The live dev-environment container (see
+        ``src/core/dev_environment.py``) runs on ``python:3.12-alpine``,
+        which already ships ``python3``/``pip`` — so Python stacks need no
+        extra runtime package.  Every other language installs its runtime
+        from Alpine's package repository by these names (which differ from
+        their Debian equivalents, e.g. ``go`` not ``golang``,
+        ``openjdk17`` not ``default-jdk``).
+        """
+        base: List[str] = []
+        lang = self.language.lower()
+        if lang == "python":
+            base = []  # python3 + pip already in the base image
+        elif lang in ("nodejs", "node", "javascript", "typescript"):
+            base = ["nodejs", "npm"]
+        elif lang == "go":
+            base = ["go"]
+        elif lang == "rust":
+            base = ["rust", "cargo"]
+        elif lang == "ruby":
+            base = ["ruby"]
+        elif lang in ("java", "kotlin"):
+            base = ["openjdk17", "maven"]
+        elif lang == "php":
+            base = ["php"]
         return base + self.extra_apt
 
 
