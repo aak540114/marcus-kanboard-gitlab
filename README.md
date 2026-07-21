@@ -199,6 +199,38 @@ Once connected, the simplest way to run an agent is **orchestrate mode** — pro
 
 Marcus hands out the next human-readied ticket, posts a summarized progress comment on each report, and completes the ticket through the gate — the agent needs no other tool. Alternatively, point the agent at a specific ticket: it calls `get_work_context`, which returns a `clone_url` it uses to `git clone` the repo into its own directory, then works on the pre-made branch. `prompts/Kanboard_Agent_Prompt.md` is the full agent operating manual (auth, gate modes, both flows). For a **remote** agent to clone a private repo seamlessly, set `GITEA_PUBLIC_URL` to a browser-reachable address and provide a `GITEA_AGENT_TOKEN`.
 
+### 3. Running multiple agents / multiple accounts
+
+Marcus is already a parallel multi-agent coordinator — you don't wire anything special. **Each MCP session that calls `marcus_work` with no `agent_id` gets its own worker id auto-generated** (`worker-<hex>`), which it echoes back on later calls. So "N agents" just means **N MCP client sessions each running the orchestrate prompt above**. When one worker is handed a ticket, Marcus claims it under that worker's id, so the next worker's `marcus_work` call skips it and takes the next Ready ticket — two agents naturally land on different tickets, different branches, both `In Progress`.
+
+**Two Claude Pro accounts on one machine.** Claude Code stores its login per config directory, so give each account its own (or use two machines / containers / OS users). In two terminals:
+
+```bash
+# Terminal 1 — account A
+export CLAUDE_CONFIG_DIR=~/.claude-acctA
+claude login                                  # log into Pro account A
+claude mcp add --transport http marcus http://<HOST>:4298/mcp \
+  -H "Authorization: Bearer <MARCUS_AGENT_TOKEN>"   # drop -H on a no-token localhost setup
+claude                                         # then paste the orchestrate prompt
+
+# Terminal 2 — account B (identical, different config dir + account)
+export CLAUDE_CONFIG_DIR=~/.claude-acctB
+claude login                                  # log into Pro account B
+claude mcp add --transport http marcus http://<HOST>:4298/mcp \
+  -H "Authorization: Bearer <MARCUS_AGENT_TOKEN>"
+claude
+```
+
+Give **both** sessions the same orchestrate prompt from step 2 (or the fuller version in `prompts/Kanboard_Agent_Prompt.md` §0).
+
+**Creating actual parallel work.** Concurrency is bounded by how many workable tickets exist. Either:
+- put **2+ tickets in `Ready`, each assigned to a human** (assigned-to-anyone + Ready is the trigger) — one agent per ticket; or
+- create **one big ticket (4+ acceptance criteria)** — Marcus auto-decomposes it into sub-tickets (each Ready) that the agents pick up independently (or force it with a `@marcus decompose` comment).
+
+Dependencies are respected: a ticket that `depends_on` another is held (Blocked) until its dependency merges, so agents never build on unfinished work. `MARCUS_MAX_PARALLEL_AGENTS` (default `3`) caps Marcus's internal auto-start slot pool — two agents are well under it, so no change is needed.
+
+**Who pays for what.** Each account's *coding* rides its own subscription — that's the parallelism. Marcus's *own* orchestration calls (decomposition, acceptance-criteria generation, report summaries) are a **separate** budget: whatever Marcus itself is configured with (its own `claude` CLI login or an API key — see [AI provider](#ai-provider)). Effectively three LLM identities: A codes, B codes, Marcus coordinates.
+
 ### Tearing down
 
 ```bash
