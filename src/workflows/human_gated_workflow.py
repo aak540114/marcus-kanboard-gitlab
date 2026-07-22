@@ -940,7 +940,11 @@ class HumanGatedWorkflow:
             "commit, THEN call `marcus_work` with `report=\"DONE - <one-line "
             "summary>\"` (start the report with the word DONE). If you hit "
             "something only a human can resolve, call with `report=\"BLOCKED - "
-            "<reason>\"`."
+            "<reason>\"`.\n"
+            "DO NOT run dev servers, start Docker containers, or bind host "
+            "ports (no `npm run dev`, `python -m http.server`, `docker run`, "
+            "etc.). Your ONLY outputs are commits pushed to the branch. The "
+            "human previews your pushed work through Marcus — you never run it."
         )
 
     def _classify_report_intent(self, report: str) -> str:
@@ -2173,6 +2177,17 @@ class HumanGatedWorkflow:
 
         mapping = await self._resolve_project_repo_mapping(kanboard_project_id)
         repo_path = mapping.get("local_repo_path") if mapping else None
+        return self._branch_for_repo_path(repo_path)
+
+    def _branch_for_repo_path(self, repo_path: Optional[str]) -> BranchManager:
+        """Return a cached BranchManager bound to *repo_path*.
+
+        Split out from :meth:`_branch_for_ticket` so callers that already
+        resolved the ticket's repo path (e.g. ``start_dev_environment``) can
+        reuse it WITHOUT re-running the project→repo lookup (which can trigger
+        an on-demand Gitea provisioning). ``None`` → the constructor's fallback
+        manager (deployments without project sync, and unit-test doubles).
+        """
         if not repo_path:
             return self._branch
 
@@ -2226,6 +2241,24 @@ class HumanGatedWorkflow:
 
         mapping = await self._resolve_project_repo_mapping(kanboard_project_id)
         repo_path = mapping.get("local_repo_path") if mapping else None
+
+        # Pull the agent's latest pushed commits into Marcus's local clone
+        # FIRST, so the preview reflects the ticket's REMOTE branch (the
+        # committed-and-pushed work), not whatever stale state the local clone
+        # held. The container is then cloned from this freshly-synced clone.
+        # Reuse the already-resolved repo_path so we don't re-run the
+        # project→repo lookup (which can re-trigger repo provisioning).
+        if record.branch_name:
+            try:
+                branch_mgr = self._branch_for_repo_path(repo_path)
+                await branch_mgr.sync_branch(record.branch_name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not sync branch %s before preview for %s: %s",
+                    record.branch_name,
+                    ticket_id,
+                    exc,
+                )
 
         try:
             info = await self._dev_env.start(

@@ -211,6 +211,48 @@ class BranchManager:
 
         return True
 
+    async def sync_branch(self, branch_name: str) -> bool:
+        """Fetch *branch_name* from the remote and move the local ref to it.
+
+        Makes this repo's LOCAL ``branch_name`` match the remote's latest —
+        without checking it out — so a downstream consumer that clones this
+        repo (the per-ticket preview container clones Marcus's working repo)
+        sees the newest pushed work. This is how Marcus makes a "preview"
+        reflect the AI agent's committed-and-pushed remote branch rather than
+        whatever stale state its local clone happened to hold.
+
+        Parameters
+        ----------
+        branch_name : str
+            Branch to sync from the remote.
+
+        Returns
+        -------
+        bool
+            ``True`` if the branch was fetched and the local ref updated.
+            ``False`` if the remote fetch failed (e.g. the branch isn't on
+            the remote yet).
+        """
+        rc, _, stderr = await self._git("fetch", self.config.remote, branch_name)
+        if rc != 0:
+            logger.warning(
+                "Could not fetch %s from %s: %s",
+                branch_name,
+                self.config.remote,
+                stderr,
+            )
+            return False
+        # Point the local branch at what we just fetched (FETCH_HEAD), without
+        # checking it out. `branch -f` is refused if the branch is currently
+        # checked out — Marcus's working clone normally sits on main, so this
+        # succeeds; on the rare exception we fall back to update-ref.
+        rc, _, _ = await self._git("branch", "-f", branch_name, "FETCH_HEAD")
+        if rc != 0:
+            await self._git(
+                "update-ref", f"refs/heads/{branch_name}", "FETCH_HEAD"
+            )
+        return True
+
     async def push(self, branch_name: str, *, force: bool = False) -> bool:
         """Push *branch_name* to the configured remote.
 

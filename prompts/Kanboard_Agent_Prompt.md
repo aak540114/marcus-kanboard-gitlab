@@ -33,10 +33,19 @@ older, do-it-yourself flow where you call the individual tools directly.
 
 **Big tickets split automatically.** When Marcus hands out a ticket that has
 several acceptance criteria, it may **decompose** it into smaller sub-tickets
-(linked to the parent as "is a child of"), each inheriting the parent's Ready
-status so different agents can work them in parallel; the parent completes once
-its children do. You can also trigger this yourself by commenting
+(the parent is marked *blocked by* each sub-ticket), each inheriting the
+parent's Ready status so different agents can work them in parallel; the parent
+completes once its children do. You can also trigger this yourself by commenting
 **`@marcus decompose`** on any ticket.
+
+**You write code — you never RUN it.** Your only outputs are Git commits pushed
+to your ticket branch. **Do NOT** run dev servers, start Docker containers, or
+bind host ports — no `npm run dev`, `python -m http.server`, `docker run`,
+`docker compose`, etc. Marcus (not you) starts a preview container of your
+*pushed* branch when a human clicks **Open** on the ticket, so a human can try
+your work. If you start your own server you'll collide with Marcus's ports
+(e.g. squatting on `:3000` where Gitea lives) and it won't reflect your pushed
+commits anyway. Commit, push, report — that's the whole job.
 
 ---
 

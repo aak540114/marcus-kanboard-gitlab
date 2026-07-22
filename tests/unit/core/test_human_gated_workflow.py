@@ -77,6 +77,7 @@ def mock_branch():
     bm.create_branch = AsyncMock(return_value=True)
     bm.merge_to_main = AsyncMock(return_value=True)
     bm.rebase_on_main = AsyncMock(return_value=True)
+    bm.sync_branch = AsyncMock(return_value=True)
     bm.get_branch_commits = AsyncMock(return_value=[])
     bm.config = MagicMock()
     bm.config.main_branch = "main"
@@ -1620,6 +1621,22 @@ class TestStartDevEnvironmentResolvesRepoPath:
         call_kwargs = mock_dev_env.start.call_args.kwargs
         assert call_kwargs["repo_path"] == "./data/repos/shopping-cart"
         assert call_kwargs["ticket_id"] == "80"
+
+    @pytest.mark.asyncio
+    async def test_syncs_remote_branch_before_starting_preview(
+        self, workflow, lifecycle, mock_kanban, mock_branch, mock_dev_env
+    ):
+        """Marcus fetches the agent's pushed commits into its local clone
+        before the preview container is built, so the preview reflects the
+        REMOTE branch's committed work — not a stale local copy. (No project
+        sync here → _branch_for_repo_path(None) returns the injected manager.)"""
+        rec = lifecycle.get_or_create("83", "kanboard")
+        rec.branch_name = "ticket/kanboard/83"
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+
+        await workflow.start_dev_environment("83")
+
+        mock_branch.sync_branch.assert_awaited_once_with("ticket/kanboard/83")
 
     @pytest.mark.asyncio
     async def test_no_project_sync_passes_none_repo_path(

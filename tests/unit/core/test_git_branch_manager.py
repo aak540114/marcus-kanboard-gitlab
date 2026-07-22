@@ -212,3 +212,48 @@ class TestCreateBranchPublishesToRemote:
 
         assert ok is True
         assert not any(c[0] == "push" for c in _calls(mgr._git))
+
+
+class TestSyncBranch:
+    """sync_branch makes the local branch ref match the remote's latest, so a
+    downstream clone (the preview container) sees the pushed work."""
+
+    @pytest.mark.asyncio
+    async def test_fetches_and_moves_local_ref(self):
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+
+        ok = await mgr.sync_branch("ticket/kanboard/7")
+
+        assert ok is True
+        calls = _calls(mgr._git)
+        assert ("fetch", "origin", "ticket/kanboard/7") in calls
+        # Local branch ref moved to the freshly fetched commit.
+        assert ("branch", "-f", "ticket/kanboard/7", "FETCH_HEAD") in calls
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_remote_fetch_fails(self):
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "fetch":
+                return (1, "", "couldn't find remote ref")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+        assert await mgr.sync_branch("ticket/kanboard/7") is False
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_update_ref_when_branch_checked_out(self):
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "branch":
+                return (1, "", "cannot force update the current branch")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+        ok = await mgr.sync_branch("ticket/kanboard/7")
+        assert ok is True
+        calls = _calls(mgr._git)
+        assert ("update-ref", "refs/heads/ticket/kanboard/7", "FETCH_HEAD") in calls
